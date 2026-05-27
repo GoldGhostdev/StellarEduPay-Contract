@@ -1115,7 +1115,9 @@ async function getExchangeRates(req, res, next) {
         available: false,
         currency: targetCurrency,
         rates: null,
-        rateTimestamp: null,
+        lastFetchedAt: null,
+        stale: false,
+        staleAge: null,
         message:
           "Price feed is currently unavailable. Amounts are shown in XLM only.",
       });
@@ -1125,6 +1127,9 @@ async function getExchangeRates(req, res, next) {
       available: true,
       currency: targetCurrency,
       rates: rateEntry.rates,
+      lastFetchedAt: (rateEntry.lastSuccessfulFetch || rateEntry.fetchedAt).toISOString(),
+      stale: rateEntry.stale || false,
+      staleAge: rateEntry.staleAge || null,
       rateTimestamp: rateEntry.fetchedAt.toISOString(),
     });
   } catch (err) {

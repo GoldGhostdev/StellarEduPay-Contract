@@ -18,11 +18,12 @@ const https = require("https");
 // ── Cache ────────────────────────────────────────────────────────────────────
 
 const CACHE_TTL_MS = parseInt(process.env.PRICE_CACHE_TTL_MS || "60000", 10);
+const PRICE_STALE_THRESHOLD_MS = parseInt(process.env.PRICE_STALE_THRESHOLD_MS || "3600000", 10); // 1 hour default
 const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || null;
 
 /**
  * Cache structure (keyed by uppercase currency code):
- *   rateCache['USD'] = { rates: { XLM: 0.24, USDC: 1.00 }, fetchedAt: Date }
+ *   rateCache['USD'] = { rates: { XLM: 0.24, USDC: 1.00 }, fetchedAt: Date, lastSuccessfulFetch: Date }
  */
 const rateCache = {};
 
@@ -124,18 +125,18 @@ async function fetchRatesFromCoinGecko(currency) {
 
 /**
  * Return cached rates if fresh, otherwise fetch and cache.
+ * Implements stale-while-revalidate: if fetch fails, return stale cache with stale flag.
  * Implements request deduplication: concurrent calls for the same currency
  * share a single in-flight HTTP request.
- * Returns null (without throwing) if the price feed is unavailable —
- * callers handle this via graceful degradation.
  *
  * @param {string} currency  Uppercase ISO 4217 code (e.g. "USD", "PGK", "NGN")
- * @returns {Promise<{ rates: { XLM: number, USDC: number }, fetchedAt: Date } | null>}
+ * @returns {Promise<{ rates: { XLM: number, USDC: number }, fetchedAt: Date, stale?: boolean, staleAge?: number } | null>}
  */
 async function getRates(currency) {
   const key = currency.toUpperCase();
   const cached = rateCache[key];
 
+  // Return fresh cache if available
   if (cached && Date.now() - cached.fetchedAt.getTime() < CACHE_TTL_MS) {
     return cached;
   }
@@ -154,20 +155,26 @@ async function getRates(currency) {
   const fetchPromise = (async () => {
     try {
       const rates = await fetchRatesFromCoinGecko(key.toLowerCase());
-      const entry = { rates, fetchedAt: new Date() };
+      const now = new Date();
+      const entry = { rates, fetchedAt: now, lastSuccessfulFetch: now };
       rateCache[key] = entry;
       delete inFlightRequests[key];
       return entry;
     } catch (err) {
       delete inFlightRequests[key];
       console.warn("[CurrencyConversion] Price feed unavailable:", err.message);
-      // Return stale cache if present rather than nothing
+      
+      // Stale-while-revalidate: return stale cache if within threshold
       if (cached) {
-        console.warn(
-          "[CurrencyConversion] Serving stale rate from",
-          cached.fetchedAt.toISOString(),
-        );
-        return cached;
+        const staleAge = Math.floor((Date.now() - cached.lastSuccessfulFetch.getTime()) / 1000);
+        if (staleAge < PRICE_STALE_THRESHOLD_MS / 1000) {
+          console.warn(
+            "[CurrencyConversion] Serving stale rate from",
+            cached.lastSuccessfulFetch.toISOString(),
+            `(${staleAge}s old)`,
+          );
+          return { ...cached, stale: true, staleAge };
+        }
       }
       throw err;
     }
@@ -197,6 +204,8 @@ async function getRates(currency) {
  *   rate:           number | null,   // exchange rate used (assetCode → currency)
  *   rateTimestamp:  string | null,   // ISO string of when rate was fetched
  *   available:      boolean,         // false when price feed was unavailable
+ *   stale:          boolean,         // true if rate is older than CACHE_TTL_MS but within PRICE_STALE_THRESHOLD_MS
+ *   staleAge:       number | null,   // seconds since last successful fetch (only if stale: true)
  * }>}
  */
 async function convertToLocalCurrency(
@@ -214,6 +223,8 @@ async function convertToLocalCurrency(
       rate: null,
       rateTimestamp: null,
       available: false,
+      stale: false,
+      staleAge: null,
     };
   }
 
@@ -228,6 +239,8 @@ async function convertToLocalCurrency(
       rate: null,
       rateTimestamp: rateEntry.fetchedAt.toISOString(),
       available: false,
+      stale: rateEntry.stale || false,
+      staleAge: rateEntry.staleAge || null,
     };
   }
 
@@ -237,6 +250,8 @@ async function convertToLocalCurrency(
     rate,
     rateTimestamp: rateEntry.fetchedAt.toISOString(),
     available: true,
+    stale: rateEntry.stale || false,
+    staleAge: rateEntry.staleAge || null,
   };
 }
 

@@ -38,6 +38,12 @@ const schoolSchema = new mongoose.Schema(
      */
     localCurrency:  { type: String, default: 'USD', uppercase: true, trim: true },
     /**
+     * School's timezone (IANA timezone identifier, e.g. "America/New_York", "Pacific/Port_Moresby").
+     * Used for date grouping in reports and dashboard metrics.
+     * Defaults to UTC.
+     */
+    timezone:       { type: String, default: 'UTC', trim: true },
+    /**
      * Per-school HMAC secret used to sign outbound webhook deliveries.
      * Recipients verify the X-StellarEduPay-Signature header to confirm
      * the payload originated from this server and was not tampered with.

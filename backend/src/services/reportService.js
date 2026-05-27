@@ -7,9 +7,9 @@ const FeeStructure = require('../models/feeStructureModel');
 /**
  * Aggregate confirmed payments grouped by date (YYYY-MM-DD), scoped to a school.
  *
- * @param {{ schoolId: string, startDate?: string, endDate?: string }} options
+ * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string }} options
  */
-async function aggregateByDate({ schoolId, startDate, endDate } = {}) {
+async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' } = {}) {
   const match = { schoolId, status: 'SUCCESS', studentDeleted: { $ne: true } };
 
   if (startDate || endDate) {
@@ -22,7 +22,7 @@ async function aggregateByDate({ schoolId, startDate, endDate } = {}) {
     { $match: match },
     {
       $group: {
-        _id: { $dateToString: { format: '%Y-%m-%d', date: '$confirmedAt' } },
+        _id: { $dateToString: { format: '%Y-%m-%d', date: '$confirmedAt', timezone } },
         totalAmount:   { $sum: '$amount' },
         paymentCount:  { $sum: 1 },
         validCount:    { $sum: { $cond: [{ $eq: ['$feeValidationStatus', 'valid'] }, 1, 0] } },
@@ -52,10 +52,10 @@ async function aggregateByDate({ schoolId, startDate, endDate } = {}) {
 /**
  * Build a full summary report for one school.
  *
- * @param {{ schoolId: string, startDate?: string, endDate?: string }} options
+ * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string }} options
  */
-async function generateReport({ schoolId, startDate, endDate } = {}) {
-  const byDate = await aggregateByDate({ schoolId, startDate, endDate });
+async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' } = {}) {
+  const byDate = await aggregateByDate({ schoolId, startDate, endDate, timezone });
 
   const totals = byDate.reduce(
     (acc, row) => {
@@ -164,11 +164,22 @@ function reportToCsv(report) {
 
 /**
  * Aggregate dashboard metrics for a school.
- * @param {{ schoolId: string }} options
+ * @param {{ schoolId: string, timezone?: string }} options
  */
-async function getDashboardMetrics({ schoolId } = {}) {
+async function getDashboardMetrics({ schoolId, timezone = 'UTC' } = {}) {
+  // Calculate start of today in the school's timezone
   const now = new Date();
-  const startOfToday = new Date(now.toISOString().slice(0, 10) + 'T00:00:00.000Z');
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = formatter.formatToParts(now);
+  const dateMap = {};
+  parts.forEach(p => { dateMap[p.type] = p.value; });
+  const todayStr = `${dateMap.year}-${dateMap.month}-${dateMap.day}`;
+  const startOfToday = new Date(todayStr + 'T00:00:00.000Z');
 
   const [
     totalStudents,
