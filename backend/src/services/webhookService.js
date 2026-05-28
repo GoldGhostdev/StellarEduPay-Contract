@@ -4,6 +4,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const WebhookRetry = require('../models/webhookRetryModel');
+const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 
 const WEBHOOK_TIMEOUT_MS = 10000; // 10 second timeout
 
@@ -62,6 +63,12 @@ function getBackoffDelay(attemptNumber) {
  */
 async function fireWebhook(url, event, payload, secret = null, deliveryId = null) {
   if (!url) return { success: false, error: 'No webhook URL configured', deliveryId: null };
+
+  const urlValidation = await validateWebhookUrl(url);
+  if (!urlValidation.valid) {
+    logger.error('Webhook delivery blocked: URL failed SSRF validation', { url, reason: urlValidation.reason });
+    return { success: false, error: 'Invalid or disallowed webhook URL', deliveryId: null };
+  }
 
   const timestamp = Math.floor(Date.now() / 1000);
   const id = deliveryId || uuidv4();
@@ -194,6 +201,16 @@ async function processPendingRetries() {
  * @param {object} retry - WebhookRetry document
  */
 async function retryWebhook(retry) {
+  const urlValidation = await validateWebhookUrl(retry.url);
+  if (!urlValidation.valid) {
+    logger.error('Webhook retry blocked: URL failed SSRF validation', { url: retry.url, reason: urlValidation.reason });
+    await WebhookRetry.updateOne(
+      { _id: retry._id },
+      { $set: { status: 'failed', lastError: 'Invalid or disallowed webhook URL', lastAttemptAt: new Date() } }
+    );
+    return;
+  }
+
   const startTime = Date.now();
   const attemptNumber = retry.attemptCount + 1;
   const timestamp = Math.floor(Date.now() / 1000);

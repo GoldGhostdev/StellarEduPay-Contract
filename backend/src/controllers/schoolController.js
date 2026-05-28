@@ -5,6 +5,7 @@ const StellarSdk = require('@stellar/stellar-sdk');
 const School = require('../models/schoolModel');
 const { logAudit } = require('../services/auditService');
 const { verifyStellarAccountFunding } = require('../services/stellarAccountVerificationService');
+const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 
 function isValidTimezone(tz) {
   try {
@@ -328,4 +329,50 @@ async function activateSchool(req, res, next) {
   }
 }
 
-module.exports = { createSchool, getAllSchools, getSchool, updateSchool, deactivateSchool, deactivateSchoolEndpoint, activateSchool };
+// POST /api/schools/:slug/webhooks
+async function registerWebhook(req, res, next) {
+  try {
+    const { webhookUrl } = req.body;
+
+    if (!webhookUrl || typeof webhookUrl !== 'string') {
+      return res.status(400).json({ error: 'webhookUrl is required', code: 'VALIDATION_ERROR' });
+    }
+
+    const validation = await validateWebhookUrl(webhookUrl);
+    if (!validation.valid) {
+      return res.status(400).json({ error: 'webhookUrl must use https:// and resolve to a public IP address', code: 'INVALID_WEBHOOK_URL' });
+    }
+
+    const school = await School.findOneAndUpdate(
+      { slug: req.params.slug, isActive: true },
+      { webhookUrl },
+      { new: true }
+    );
+
+    if (!school) {
+      const e = new Error('School not found');
+      e.code = 'NOT_FOUND';
+      return next(e);
+    }
+
+    if (req.auditContext) {
+      await logAudit({
+        schoolId: school.schoolId,
+        action: 'school_webhook_register',
+        performedBy: req.auditContext.performedBy,
+        targetId: school.schoolId,
+        targetType: 'school',
+        details: { webhookUrl },
+        result: 'success',
+        ipAddress: req.auditContext.ipAddress,
+        userAgent: req.auditContext.userAgent,
+      });
+    }
+
+    res.json({ webhookUrl: school.webhookUrl });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { createSchool, getAllSchools, getSchool, updateSchool, deactivateSchool, deactivateSchoolEndpoint, activateSchool, registerWebhook };

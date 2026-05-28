@@ -45,6 +45,11 @@ const allowedOrigins = parseAllowedOrigins();
 
 const app = express();
 
+// Trust the number of proxy hops configured via TRUSTED_PROXY_HOPS (default: 1).
+// This ensures Express derives req.ip from the correct X-Forwarded-For entry
+// rather than trusting client-supplied headers, which would allow rate-limit bypass.
+app.set('trust proxy', parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10));
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(cors({
   origin: allowedOrigins,

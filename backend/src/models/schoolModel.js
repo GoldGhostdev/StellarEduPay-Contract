@@ -44,6 +44,12 @@ const schoolSchema = new mongoose.Schema(
      */
     timezone:       { type: String, default: 'UTC', trim: true },
     /**
+     * Per-school webhook endpoint URL. Must be an https:// URL that resolves
+     * to a public IP address (RFC 1918, loopback, and link-local are rejected).
+     * Validated at registration time and on each delivery attempt.
+     */
+    webhookUrl:     { type: String, default: null },
+    /**
      * Per-school HMAC secret used to sign outbound webhook deliveries.
      * Recipients verify the X-StellarEduPay-Signature header to confirm
      * the payload originated from this server and was not tampered with.
