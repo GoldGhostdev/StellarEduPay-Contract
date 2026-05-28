@@ -331,18 +331,28 @@ async function getPaymentSummary(req, res, next) {
 
 const CSV_MAX_SIZE_BYTES = parseInt(process.env.CSV_MAX_SIZE_BYTES, 10) || 5 * 1024 * 1024; // 5 MB
 const CSV_MAX_ROWS = parseInt(process.env.CSV_MAX_ROWS, 10) || 10000;
+const CSV_MAX_COLUMNS = parseInt(process.env.CSV_MAX_COLUMNS, 10) || 20;
 
 function parseCsvBuffer(buffer) {
   return new Promise((resolve, reject) => {
     const rows = [];
     const stream = Readable.from(buffer);
+    let lineNumber = 1;
     stream
       .pipe(csv())
       .on('data', (row) => {
+        lineNumber++;
         if (rows.length >= CSV_MAX_ROWS) {
           stream.destroy();
           const err = new Error(`CSV exceeds maximum row limit of ${CSV_MAX_ROWS}`);
           err.code = 'CSV_TOO_MANY_ROWS';
+          err.status = 400;
+          return reject(err);
+        }
+        if (Object.keys(row).length > CSV_MAX_COLUMNS) {
+          stream.destroy();
+          const err = new Error(`Row ${lineNumber} has too many columns. Max is ${CSV_MAX_COLUMNS}`);
+          err.code = 'CSV_INVALID_FORMAT';
           err.status = 400;
           return reject(err);
         }
@@ -677,4 +687,4 @@ async function reconcileStudent(req, res, next) {
   }
 }
 
-module.exports = { registerStudent, getAllStudents, getStudent, updateStudent, deleteStudent, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent };
+module.exports = { registerStudent, getAllStudents, getStudent, updateStudent, deleteStudent, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer };
