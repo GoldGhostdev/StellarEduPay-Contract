@@ -137,6 +137,16 @@ export default function Dashboard() {
         .pagination-controls { display: flex; align-items: center; gap: 0.5rem; }
       `}</style>
 
+      {/* aria-live region for screen readers */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only" style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0,0,0,0)", whiteSpace: "nowrap" }}>
+        {summaryLoading || studentsLoading ? "Loading dashboard data..." : "Dashboard data loaded."}
+      </div>
+      {(summaryError || studentsError) && (
+        <div aria-live="assertive" aria-atomic="true" className="sr-only" style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0,0,0,0)", whiteSpace: "nowrap" }}>
+          {summaryError || studentsError}
+        </div>
+      )}
+
       <div className="dash-wrap">
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
