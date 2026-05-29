@@ -1599,6 +1599,11 @@ async function updatePaymentStatus(req, res, next) {
       return res.status(400).json({ error: 'status and reason are required', code: 'VALIDATION_ERROR' });
     }
 
+    // Prevent transitioning to PENDING from any state
+    if (newStatus === 'PENDING') {
+      return res.status(400).json({ error: 'Cannot transition to PENDING', code: 'INVALID_TRANSITION' });
+    }
+
     const payment = await Payment.findOne({ schoolId: req.schoolId, txHash }).lean();
     if (!payment) {
       const err = new Error('Payment not found');

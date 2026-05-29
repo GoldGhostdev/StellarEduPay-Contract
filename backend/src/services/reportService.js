@@ -51,6 +51,7 @@ async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' 
 
 /**
  * Build a full summary report for one school.
+ * Includes all students, even those with no payment history.
  *
  * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string }} options
  */
@@ -84,25 +85,43 @@ async function generateReport({ schoolId, startDate, endDate, timezone = 'UTC' }
     feePaid: true,
   });
 
-  // Per-class breakdown: total collected, paid/unpaid student counts, payment count
-  const byClass = await Payment.aggregate([
-    { $match: { ...match, studentId: { $exists: true } } },
+  // Per-class breakdown: start from Student collection and lookup payments
+  // This ensures students with no payments are included
+  const byClass = await Student.aggregate([
+    { $match: { schoolId, deletedAt: null } },
     {
       $lookup: {
-        from: 'students',
-        localField: 'studentId',
-        foreignField: 'studentId',
-        as: 'student',
+        from: 'payments',
+        let: { studentId: '$studentId' },
+        pipeline: [
+          {
+            $match: {
+              $expr: { $eq: ['$studentId', '$$studentId'] },
+              schoolId,
+              status: 'SUCCESS',
+              studentDeleted: { $ne: true },
+              deletedAt: null,
+            },
+          },
+          {
+            $match: startDate || endDate ? {
+              confirmedAt: {
+                ...(startDate ? { $gte: new Date(startDate + 'T00:00:00.000Z') } : {}),
+                ...(endDate ? { $lte: new Date(endDate + 'T23:59:59.999Z') } : {}),
+              },
+            } : {},
+          },
+        ],
+        as: 'payments',
       },
     },
-    { $unwind: { path: '$student', preserveNullAndEmpty: false } },
     {
       $group: {
-        _id: '$student.class',
-        totalCollected: { $sum: '$amount' },
-        paymentCount: { $sum: 1 },
-        paidStudentIds: { $addToSet: { $cond: ['$student.feePaid', '$studentId', '$$REMOVE'] } },
-        unpaidStudentIds: { $addToSet: { $cond: ['$student.feePaid', '$$REMOVE', '$studentId'] } },
+        _id: '$class',
+        totalCollected: { $sum: { $sum: '$payments.amount' } },
+        paymentCount: { $sum: { $size: '$payments' } },
+        paidStudentIds: { $addToSet: { $cond: ['$feePaid', '$studentId', '$$REMOVE'] } },
+        unpaidStudentIds: { $addToSet: { $cond: ['$feePaid', '$$REMOVE', '$studentId'] } },
       },
     },
     {

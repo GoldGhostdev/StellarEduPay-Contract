@@ -32,6 +32,21 @@ const schoolSchema = new mongoose.Schema(
     adminEmail:     { type: String, default: null },
     address:        { type: String, default: null },
     /**
+     * Contact email for the school. Used for reminder emails, receipts, and admin notifications.
+     * Must be a valid email format.
+     */
+    contactEmail:   {
+      type: String,
+      default: null,
+      validate: {
+        validator: function(v) {
+          if (!v) return true; // Allow null/empty
+          return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+        },
+        message: 'Invalid email address format',
+      },
+    },
+    /**
      * Preferred local currency for fee display (ISO 4217 code, uppercase).
      * Used by the currency conversion layer to show fiat equivalents.
      * e.g. "USD" for US schools, "PGK" for Papua New Guinea, "NGN" for Nigeria.
