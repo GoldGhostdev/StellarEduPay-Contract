@@ -28,7 +28,9 @@ export const getStudents = (page = 1, limit = 20, { search, status, className } 
       ...(className && { class: className }),
     },
   });
+export const getStudent = (studentId) => api.get(`/students/${studentId}`);
 export const registerStudent = (data) => api.post("/students", data);
+export const updateStudent = (studentId, data) => api.patch(`/students/${studentId}`, data);
 export const getPaymentSummary = () => api.get("/payments/summary");
 export const getPaymentInstructions = (studentId) => api.get(`/payments/instructions/${studentId}`);
 export const getStudentPayments = (studentId) => api.get(`/payments/${studentId}`);

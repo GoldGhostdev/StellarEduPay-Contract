@@ -542,6 +542,27 @@ This will start:
 openssl rand -base64 32
 ```
 
+**Memory Limits**: The Docker Compose configuration includes memory limits to prevent OOM (out-of-memory) kills:
+
+| Service | Default Limit | Purpose |
+|---------|---------------|---------|
+| Backend | 512 MB | Node.js process with `--max-old-space-size=400` |
+| Frontend | 256 MB | Next.js build and runtime |
+| Redis | 128 MB | In-memory cache |
+| MongoDB | 1 GB | Database with indexes |
+
+To customize memory allocation, set environment variables before running:
+
+```bash
+export BACKEND_MEM_LIMIT=1g
+export FRONTEND_MEM_LIMIT=512m
+export REDIS_MEM_LIMIT=256m
+export MONGO_MEM_LIMIT=2g
+docker compose up --build
+```
+
+The backend includes heap monitoring that logs warnings when memory usage exceeds 80% of the configured limit. Check logs for `HEAP_USAGE_WARNING` to detect memory leaks early.
+
 ### Initial Setup: Seed Data
 
 Once the application is running, seed some initial data:

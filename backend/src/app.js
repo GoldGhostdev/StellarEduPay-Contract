@@ -28,6 +28,7 @@ const { startReminderScheduler, stopReminderScheduler } = require('./services/re
 const { startWorker: startTxQueueWorker, stopWorker: stopTxQueueWorker } = require('./services/transactionQueueService');
 const { startSessionCleanupScheduler, stopSessionCleanupScheduler } = require('./services/sessionCleanupService');
 const { startReconciliationScheduler, stopReconciliationScheduler } = require('./services/reconciliationService');
+const { startAuditLogCleanupScheduler, stopAuditLogCleanupScheduler } = require('./services/auditLogCleanupService');
 const { closeQueue } = require('./queue/transactionQueue');
 const bullMQRetryService = require('./services/bullMQRetryService');
 const { initializeRetryQueue, setupMonitoring } = require('./config/retryQueueSetup');
@@ -38,6 +39,7 @@ const { requireAdminAuth } = require('./middleware/auth');
 const { runConsistencyCheck } = require('./controllers/consistencyController');
 const { healthCheck } = require('./controllers/healthController');
 const logger = require('./utils/logger');
+const { startHeapMonitoring } = require('./utils/heapMonitoring');
 
 const morgan = require('morgan');
 const cookieParser = require('cookie-parser');
@@ -140,6 +142,9 @@ mongoose.connection.on('error', (err) =>
 );
 
 connectWithRetry().then(async () => {
+  // Start heap monitoring to detect memory leaks early
+  startHeapMonitoring();
+
   // Seed default system config entries on first run
   const SystemConfig = require('./models/systemConfigModel');
   const DEFAULTS = [
@@ -170,6 +175,7 @@ connectWithRetry().then(async () => {
   startReminderScheduler();
   startSessionCleanupScheduler();
   startReconciliationScheduler();
+  startAuditLogCleanupScheduler();
   registerPaymentSavedSubscribers();
 
   // Only initialise BullMQ when Redis is configured
@@ -205,6 +211,7 @@ async function shutdown(signal) {
   stopReminderScheduler();
   stopSessionCleanupScheduler();
   stopReconciliationScheduler();
+  stopAuditLogCleanupScheduler();
 
   try {
     await stopTxQueueWorker();

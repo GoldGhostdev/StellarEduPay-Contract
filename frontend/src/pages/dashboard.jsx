@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import SyncButton from "../components/SyncButton";
 import ErrorBoundary from "../components/ErrorBoundary";
-import { getSyncStatus, getPaymentSummary, getStudents } from "../services/api";
+import StudentForm from "../components/StudentForm";
+import { getSyncStatus, getPaymentSummary, getStudents, getStudent } from "../services/api";
 
 const PAGE_SIZE = 20;
 
@@ -37,6 +38,8 @@ export default function Dashboard() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [classFilter, setClassFilter]   = useState("");
   const [error, setError]               = useState(null);
+  const [editingStudent, setEditingStudent] = useState(null);
+  const [editingStudentData, setEditingStudentData] = useState(null);
 
   // Debounce search input so we don't fire a request on every keystroke.
   const searchDebounceRef = useRef(null);
@@ -95,6 +98,26 @@ export default function Dashboard() {
     fetchSummary();
     setPage(1);
     fetchStudents(1, debouncedSearch, statusFilter, classFilter);
+  }
+
+  async function handleEditStudent(student) {
+    try {
+      const { data } = await getStudent(student.studentId);
+      setEditingStudentData(data);
+      setEditingStudent(student.studentId);
+    } catch (err) {
+      setError("Failed to load student details");
+    }
+  }
+
+  function handleCloseForm() {
+    setEditingStudent(null);
+    setEditingStudentData(null);
+  }
+
+  function handleSaveStudent() {
+    handleCloseForm();
+    fetchStudents(page, debouncedSearch, statusFilter, classFilter);
   }
 
   const stats = [
@@ -278,12 +301,13 @@ export default function Dashboard() {
                       <th scope="col">Class</th>
                       <th scope="col">Fee</th>
                       <th scope="col">Status</th>
+                      <th scope="col">Action</th>
                     </tr>
                   </thead>
                   <tbody>
                     {students.length === 0 ? (
                       <tr>
-                        <td colSpan="5" style={{ textAlign: "center", padding: "2.5rem", color: "var(--muted)" }}>
+                        <td colSpan="6" style={{ textAlign: "center", padding: "2.5rem", color: "var(--muted)" }}>
                           No students found.
                         </td>
                       </tr>
@@ -298,6 +322,22 @@ export default function Dashboard() {
                           <td>{s.feeAmount} XLM</td>
                           <td>
                             <span className="status-badge" style={badge}>{st}</span>
+                          </td>
+                          <td>
+                            <button
+                              onClick={() => handleEditStudent(s)}
+                              style={{
+                                padding: "0.4rem 0.8rem",
+                                border: "1px solid var(--border)",
+                                borderRadius: "4px",
+                                background: "var(--bg)",
+                                color: "var(--text)",
+                                cursor: "pointer",
+                                fontSize: "0.8rem",
+                              }}
+                            >
+                              Edit
+                            </button>
                           </td>
                         </tr>
                       );
@@ -344,6 +384,14 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+
+      {editingStudentData && (
+        <StudentForm
+          student={editingStudentData}
+          onClose={handleCloseForm}
+          onSave={handleSaveStudent}
+        />
+      )}
     </>
   );
 }
