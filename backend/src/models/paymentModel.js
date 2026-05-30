@@ -150,4 +150,44 @@ paymentSchema.post('init', function () {
   }
 });
 
+// Issue #669: Send payment receipt email on SUCCESS transition
+paymentSchema.post('save', async function () {
+  try {
+    // Check if status transitioned to SUCCESS
+    const savedState = this.$__ && this.$__.savedState;
+    const originalStatus = savedState ? savedState.status : null;
+    const newStatus = this.status;
+
+    if (originalStatus !== 'SUCCESS' && newStatus === 'SUCCESS') {
+      // Status transitioned to SUCCESS — queue receipt email
+      const Student = require('../models/studentModel');
+      const student = await Student.findOne({
+        schoolId: this.schoolId,
+        studentId: this.studentId,
+      });
+
+      if (student && student.contactEmail) {
+        // Queue email via BullMQ (non-blocking)
+        const emailService = require('./emailService');
+        await emailService.sendPaymentReceipt({
+          to: student.contactEmail,
+          studentName: student.name,
+          amount: this.amount,
+          txHash: this.txHash,
+          confirmedAt: this.confirmedAt,
+          remainingBalance: student.feeAmount - this.amount,
+        });
+      }
+    }
+  } catch (err) {
+    // Log error but don't fail the save
+    const logger = require('../utils/logger');
+    logger.error({
+      msg: 'Failed to queue payment receipt email',
+      paymentId: this._id,
+      error: err.message,
+    });
+  }
+});
+
 module.exports = mongoose.model('Payment', paymentSchema);
