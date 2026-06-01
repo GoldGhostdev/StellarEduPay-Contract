@@ -16,6 +16,7 @@ const {
   resetPayment,
   reconcileStudent,
   getFeeHistory,
+  exportStudents,
 } = require('../controllers/studentController');
 const { resubscribeReminders } = require('../controllers/reminderController');
 const { validateRegisterStudent, validateStudentIdParam } = require('../middleware/validate');
@@ -32,6 +33,7 @@ router.use(resolveSchool);
 router.post('/', requireAdminAuth, validateRegisterStudent, registerStudent);
 router.post('/bulk', requireAdminAuth, bulkImportLimiter, express.json({ limit: '1mb' }), upload.single('file'), bulkImportStudents);
 router.get('/', requireAdminAuth, getAllStudents);
+router.get('/export', requireAdminAuth, exportStudents);
 
 // Public routes
 router.get('/summary', getPaymentSummary);

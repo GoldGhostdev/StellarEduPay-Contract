@@ -766,4 +766,69 @@ async function reconcileStudent(req, res, next) {
   }
 }
 
-module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer };
+// GET /api/students/export
+async function exportStudents(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const includeDeleted = req.query.includeDeleted === 'true';
+
+    const filter = { schoolId };
+    if (!includeDeleted) {
+      filter.deletedAt = null;
+    }
+    if (req.query.class) {
+      filter.class = req.query.class;
+    }
+    if (req.query.status) {
+      const status = req.query.status;
+      if (status === 'paid') {
+        filter.feePaid = true;
+      } else if (status === 'unpaid') {
+        filter.feePaid = false;
+        filter.totalPaid = { $lte: 0 };
+      } else if (status === 'partial') {
+        filter.feePaid = false;
+        filter.totalPaid = { $gt: 0 };
+      } else {
+        return res.status(400).json({ error: 'status must be paid, unpaid, or partial', code: 'VALIDATION_ERROR' });
+      }
+    }
+
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="students-${date}.csv"`);
+
+    const baseColumns = ['studentId', 'name', 'class', 'feeAmount', 'totalPaid', 'remainingBalance', 'feePaid', 'createdAt'];
+    const columns = includeDeleted ? [...baseColumns, 'deletedAt'] : baseColumns;
+
+    res.write(columns.join(',') + '\n');
+
+    const cursor = Student.find(filter).sort({ createdAt: -1 }).cursor();
+
+    cursor.on('data', (doc) => {
+      const row = columns.map((col) => {
+        const val = doc[col];
+        if (val == null) return '';
+        const str = String(val);
+        // Quote fields that contain commas, quotes, or newlines
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+      });
+      res.write(row.join(',') + '\n');
+    });
+
+    cursor.on('error', (err) => {
+      next(err);
+    });
+
+    cursor.on('end', () => {
+      res.end();
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { registerStudent, getAllStudents, getStudent, getPublicStudentInfo, updateStudent, deleteStudent, getPaymentSummary, bulkImportStudents, getOverdueStudents, resetPayment, reconcileStudent, parseCsvBuffer, exportStudents };
