@@ -3,6 +3,15 @@ import { useState } from 'react';
 import { useRouter } from 'next/router';
 import { useAdminAuth } from '../hooks/useAdminAuth';
 
+// Only honour same-origin, absolute internal paths as a post-login destination.
+// Anything else (external URLs, protocol-relative "//evil.com", missing) falls
+// back to the dashboard — prevents open-redirect via the returnTo query param.
+function safeReturnTo(returnTo) {
+  if (typeof returnTo !== 'string') return '/dashboard';
+  if (!returnTo.startsWith('/') || returnTo.startsWith('//')) return '/dashboard';
+  return returnTo;
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const { login } = useAdminAuth();
@@ -25,7 +34,7 @@ export default function LoginPage() {
       const data = await res.json();
       if (!res.ok) { setError(data.error || 'Login failed.'); return; }
       login();
-      router.push('/dashboard');
+      router.push(safeReturnTo(router.query.returnTo));
     } catch {
       setError('Network error. Please try again.');
     } finally {

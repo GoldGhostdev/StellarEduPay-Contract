@@ -67,6 +67,36 @@ function getStore() {
 // Exposed for testing
 function _resetStore() { _store = null; }
 
+// ── Cookies ───────────────────────────────────────────────────────────────────
+// The access token rides in the `admin_token` cookie (sent on every API call),
+// while the refresh token rides in `admin_refresh_token`, scoped to the auth
+// routes so it is never transmitted to ordinary endpoints. Both are HttpOnly so
+// JS — and therefore an XSS payload — can never read them.
+
+const ACCESS_COOKIE = 'admin_token';
+const REFRESH_COOKIE = 'admin_refresh_token';
+const REFRESH_COOKIE_PATH = '/api/auth';
+
+function accessCookieOptions(ttlSeconds) {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: ttlSeconds * 1000,
+    path: '/',
+  };
+}
+
+function refreshCookieOptions(ttlSeconds) {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: ttlSeconds * 1000,
+    path: REFRESH_COOKIE_PATH,
+  };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function parseTTL(envVar, defaultSeconds) {
@@ -125,14 +155,11 @@ async function handleLogin(req, res) {
   // Store refresh token (non-blocking — fire and forget; failure means token won't be usable)
   getStore().set(refreshToken, refreshTTL).catch(() => {});
 
-  res.cookie('admin_token', token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: accessTTL * 1000,
-    path: '/',
-  });
+  res.cookie(ACCESS_COOKIE, token, accessCookieOptions(accessTTL));
+  res.cookie(REFRESH_COOKIE, refreshToken, refreshCookieOptions(refreshTTL));
 
+  // refreshToken is still returned in the body for non-browser API clients that
+  // cannot use cookies; browser clients rely on the HttpOnly cookie above.
   return res.json({
     isAdmin: true,
     expiresIn: accessTTL,
@@ -143,28 +170,53 @@ async function handleLogin(req, res) {
 
 /**
  * POST /api/auth/refresh
- * Body: { refreshToken }
- * Returns { token, expiresIn }
+ * Token source: the HttpOnly `admin_refresh_token` cookie (browser flow), with
+ * a `{ refreshToken }` body fallback for non-browser API clients.
+ *
+ * Refreshes the access token AND rotates the refresh token: the presented token
+ * is invalidated and a fresh one issued, so a leaked refresh token is usable at
+ * most once. Sets new `admin_token` and `admin_refresh_token` cookies and also
+ * returns the new tokens in the body for API clients.
+ *
+ * Returns { token, expiresIn, refreshToken, refreshExpiresIn }.
  */
 async function handleRefresh(req, res) {
-  const { refreshToken } = req.body || {};
+  const refreshToken = req.cookies?.[REFRESH_COOKIE] || (req.body && req.body.refreshToken);
 
   if (!refreshToken) {
     return res.status(401).json({ error: 'Refresh token required.', code: 'MISSING_REFRESH_TOKEN' });
   }
 
-  const valid = await getStore().has(refreshToken);
+  const store = getStore();
+  const valid = await store.has(refreshToken);
   if (!valid) {
+    // Clear the stale cookie so the browser stops presenting a dead token.
+    res.clearCookie(REFRESH_COOKIE, { path: REFRESH_COOKIE_PATH });
     return res.status(401).json({ error: 'Invalid or expired refresh token.', code: 'INVALID_REFRESH_TOKEN' });
   }
 
   const jwt = require('jsonwebtoken');
   const secret = process.env.JWT_SECRET;
   const accessTTL = parseTTL('JWT_ACCESS_TOKEN_TTL', 8 * 3600);
+  const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
+
+  // Rotate: mint a new refresh token, then invalidate the one just used. Storing
+  // the new token before deleting the old avoids a window with neither valid.
+  const newRefreshToken = crypto.randomBytes(40).toString('hex');
+  await store.set(newRefreshToken, refreshTTL);
+  await store.del(refreshToken);
 
   const token = jwt.sign({ role: 'admin' }, secret, { expiresIn: accessTTL });
 
-  return res.json({ token, expiresIn: accessTTL });
+  res.cookie(ACCESS_COOKIE, token, accessCookieOptions(accessTTL));
+  res.cookie(REFRESH_COOKIE, newRefreshToken, refreshCookieOptions(refreshTTL));
+
+  return res.json({
+    token,
+    expiresIn: accessTTL,
+    refreshToken: newRefreshToken,
+    refreshExpiresIn: refreshTTL,
+  });
 }
 
 /**
@@ -173,13 +225,14 @@ async function handleRefresh(req, res) {
  * Invalidates the refresh token.
  */
 async function handleLogout(req, res) {
-  const { refreshToken } = req.body || {};
+  const refreshToken = req.cookies?.[REFRESH_COOKIE] || (req.body && req.body.refreshToken);
 
   if (refreshToken) {
     await getStore().del(refreshToken);
   }
 
-  res.clearCookie('admin_token', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/' });
+  res.clearCookie(ACCESS_COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/' });
+  res.clearCookie(REFRESH_COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: REFRESH_COOKIE_PATH });
   return res.json({ message: 'Logged out.' });
 }
 
