@@ -52,10 +52,22 @@ const securityHeaders = [
   { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
 ];
 
+// Server-side origin of the backend, used by the dev proxy (rewrites) below.
+// Lets the browser call the API same-origin (/api/*) so cookies stay first-party
+// — essential in split-host setups like GitHub Codespaces.
+const BACKEND_ORIGIN = process.env.BACKEND_PROXY_TARGET || 'http://localhost:5000';
+
 const nextConfig = {
   // Produces a self-contained build in .next/standalone — required for Docker
   output: 'standalone',
   eslint: { ignoreDuringBuilds: true },
+  // Same-origin API proxy: browser → /api/* (this origin) → backend. Keeps
+  // requests first-party so HttpOnly SameSite=Strict auth cookies are sent.
+  async rewrites() {
+    return [
+      { source: '/api/:path*', destination: `${BACKEND_ORIGIN}/api/:path*` },
+    ];
+  },
   async headers() {
     return [
       {
