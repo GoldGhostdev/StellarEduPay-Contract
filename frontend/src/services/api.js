@@ -1,4 +1,5 @@
 import axios from "axios";
+import { createRefreshHandler } from "./authRefresh";
 
 const TIMEOUT_MS = parseInt(process.env.NEXT_PUBLIC_REQUEST_TIMEOUT_MS || "15000", 10);
 
@@ -22,15 +23,26 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-api.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.response?.status === 401 && typeof window !== "undefined") {
-      window.location.href = "/login";
-    }
-    return Promise.reject(error);
-  }
-);
+// On a 401 we transparently refresh the access token (the HttpOnly cookies are
+// rotated by the backend) and replay the request, instead of hard-redirecting
+// and losing in-flight work. Only a failed refresh sends the user to /login,
+// preserving where they were via a return-to URL.
+function redirectToLogin() {
+  if (typeof window === "undefined") return;
+  const { pathname, search } = window.location;
+  if (pathname === "/login") return; // already there — avoid a redirect loop
+  const returnTo = encodeURIComponent(`${pathname}${search}`);
+  window.location.href = `/login?returnTo=${returnTo}`;
+}
+
+const onResponseRejected = createRefreshHandler({
+  refresh: () => api.post("/auth/refresh"),
+  retry: (config) => api(config),
+  redirectToLogin,
+  isAuthUrl: (url) => url.includes("/auth/"),
+});
+
+api.interceptors.response.use((response) => response, onResponseRejected);
 
 export const getStudents = (page = 1, limit = 20, { search, status, className } = {}) =>
   api.get("/students", {

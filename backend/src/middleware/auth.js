@@ -32,10 +32,10 @@ async function requireAdminAuth(req, res, next) {
   const cookieToken = req.cookies?.admin_token || null;
   const token = cookieToken || bearerToken;
 
-  const handleAuthFailure = async (reason, code) => {
-    logger.warn(`Failed admin auth attempt: ${reason} from ${ip}`, { 
-      endpoint: req.originalUrl, 
-      code 
+  const handleAuthFailure = async (reason, code, { countTowardsBlock = true } = {}) => {
+    logger.warn(`Failed admin auth attempt: ${reason} from ${ip}`, {
+      endpoint: req.originalUrl,
+      code
     });
 
     // Use X-School-ID if available, else 'system'
@@ -54,13 +54,19 @@ async function requireAdminAuth(req, res, next) {
         userAgent: req.headers?.['user-agent'],
     });
 
-    const failKey = `fail_count:${ip}`;
-    const failCount = (get(failKey) || 0) + 1;
-    set(failKey, failCount, 300); // 5 mins
+    // A normally-expired token is not a credential-guessing attempt, so it must
+    // not count toward the brute-force block — otherwise a burst of concurrent
+    // requests arriving just after the 8h access token expires would lock the
+    // IP out (429) and defeat the silent-refresh + replay flow on the client.
+    if (countTowardsBlock) {
+      const failKey = `fail_count:${ip}`;
+      const failCount = (get(failKey) || 0) + 1;
+      set(failKey, failCount, 300); // 5 mins
 
-    if (failCount >= 5) {
-        set(blockKey, true, 900); // 15 mins
-        await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+      if (failCount >= 5) {
+          set(blockKey, true, 900); // 15 mins
+          await sendAdminAlert(`IP ${ip} blocked due to repeated auth failures`, { ip, endpoint: req.originalUrl });
+      }
     }
 
     return res.status(401).json({ error: reason, code });
@@ -95,7 +101,7 @@ async function requireAdminAuth(req, res, next) {
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
-      return handleAuthFailure('Token has expired.', 'TOKEN_EXPIRED');
+      return handleAuthFailure('Token has expired.', 'TOKEN_EXPIRED', { countTowardsBlock: false });
     }
     return handleAuthFailure('Invalid token.', 'INVALID_AUTH_TOKEN');
   }
