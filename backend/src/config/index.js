@@ -44,6 +44,13 @@ const HORIZON_URL =
   process.env.HORIZON_URL ||
   "https://horizon.stellar.org";
 
+// Comma-separated, priority-ordered list of Horizon URLs for failover.
+// When set, the HorizonFailoverClient will try each URL in order.
+// Falls back to HORIZON_URL (single-endpoint mode) when not set.
+const STELLAR_HORIZON_URLS = process.env.STELLAR_HORIZON_URLS
+  ? process.env.STELLAR_HORIZON_URLS.split(',').map((u) => u.trim()).filter(Boolean)
+  : [HORIZON_URL];
+
 // Optional — only used by the migration script to seed the default school
 const SCHOOL_WALLET_ADDRESS = process.env.SCHOOL_WALLET_ADDRESS || null;
 
@@ -161,6 +168,7 @@ const config = Object.freeze({
   STELLAR_NETWORK,
   IS_TESTNET,
   HORIZON_URL,
+  STELLAR_HORIZON_URLS,
   SCHOOL_WALLET_ADDRESS,
   USDC_ISSUER,
   ACCEPTED_ASSET,

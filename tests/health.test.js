@@ -36,9 +36,22 @@ jest.mock('../backend/src/config/database', () => ({
   TRANSACTION_CONFIG: {},
 }));
 
-// stellarConfig — server.serverInfo is a controllable jest.fn()
+// stellarConfig — server.serverInfo is a controllable jest.fn();
+// horizonClient exposes .call(), .activeUrl and .getCircuitBreakerStatus()
 jest.mock('../backend/src/config/stellarConfig', () => ({
   server: { serverInfo: jest.fn() },
+  horizonClient: {
+    call: jest.fn(),
+    activeUrl: 'https://horizon-testnet.stellar.org',
+    getCircuitBreakerStatus: jest.fn().mockReturnValue([
+      {
+        url: 'https://horizon-testnet.stellar.org',
+        index: 0,
+        active: true,
+        circuitBreaker: { state: 'closed', failures: 0, openedAt: null, resetsAt: null },
+      },
+    ]),
+  },
   networkPassphrase: 'Test SDF Network ; September 2015',
   SCHOOL_WALLET: null,
   StellarSdk: {},
@@ -86,7 +99,9 @@ jest.mock('../backend/src/middleware/concurrentRequestHandler', () => ({
 }));
 
 jest.mock('../backend/src/services/concurrentPaymentProcessor', () => ({
-  concurrentPaymentProcessor: jest.fn(),
+  concurrentPaymentProcessor: {
+    getStats: jest.fn().mockReturnValue({ queueDepth: 0, maxQueueDepth: 1000 }),
+  },
 }));
 
 // Route mocks — bypass pre-existing syntax errors in some route files
@@ -142,18 +157,26 @@ const app = require('../backend/src/app');
 const database = require('../backend/src/config/database');
 const stellarConfig = require('../backend/src/config/stellarConfig');
 
+// Helper: make horizonClient.call resolve/reject as needed
+function mockHorizonOk() {
+  stellarConfig.horizonClient.call.mockResolvedValue({});
+}
+function mockHorizonFail(err) {
+  stellarConfig.horizonClient.call.mockRejectedValue(err);
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('GET /health', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: horizonClient.call resolves (healthy Stellar)
+    stellarConfig.horizonClient.call.mockResolvedValue({});
   });
 
   test('200 healthy — DB and Stellar both up', async () => {
     database.healthCheck.mockResolvedValue({ healthy: true, latency: 3, readyState: 1 });
-    stellarConfig.server.serverInfo.mockResolvedValue({
-      network_passphrase: 'Test SDF Network ; September 2015',
-    });
+    mockHorizonOk();
 
     const res = await request(app).get('/health');
 
@@ -162,52 +185,54 @@ describe('GET /health', () => {
     expect(res.body.checks.database.status).toBe('healthy');
     expect(res.body.checks.database.latency_ms).toBe(3);
     expect(res.body.checks.database.readyState).toBe(1);
-    expect(res.body.checks.stellar.status).toBe('healthy');
+    expect(res.body.checks.stellar.status).toBe('ok');
     expect(res.body.checks.stellar.network).toBeDefined();
     expect(res.body.checks.stellar.horizonUrl).toBeDefined();
+    expect(res.body.checks.stellar.activeEndpoint).toBeDefined();
+    expect(Array.isArray(res.body.checks.stellar.endpoints)).toBe(true);
   });
 
   test('503 degraded — DB unreachable', async () => {
     database.healthCheck.mockResolvedValue({ healthy: false, reason: 'Not connected' });
-    stellarConfig.server.serverInfo.mockResolvedValue({});
+    mockHorizonOk();
 
     const res = await request(app).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
+    expect(res.body.status).toBe('unhealthy');
     expect(res.body.checks.database.status).toBe('unhealthy');
     expect(res.body.checks.database.error).toBe('Not connected');
-    expect(res.body.checks.stellar.status).toBe('healthy');
+    expect(res.body.checks.stellar.status).toBe('ok');
   });
 
-  test('503 degraded — Stellar Horizon unreachable', async () => {
+  test('200 degraded — Stellar Horizon unreachable', async () => {
     database.healthCheck.mockResolvedValue({ healthy: true, latency: 4, readyState: 1 });
-    stellarConfig.server.serverInfo.mockRejectedValue(new Error('Connection refused'));
+    mockHorizonFail(new Error('Connection refused'));
 
     const res = await request(app).get('/health');
 
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(200);
     expect(res.body.status).toBe('degraded');
     expect(res.body.checks.database.status).toBe('healthy');
-    expect(res.body.checks.stellar.status).toBe('unhealthy');
+    expect(res.body.checks.stellar.status).toBe('unreachable');
     expect(res.body.checks.stellar.error).toBe('Connection refused');
   });
 
-  test('503 degraded — both DB and Stellar down', async () => {
+  test('503 unhealthy — both DB and Stellar down', async () => {
     database.healthCheck.mockResolvedValue({ healthy: false, reason: 'Ping failed' });
-    stellarConfig.server.serverInfo.mockRejectedValue(new Error('ECONNREFUSED'));
+    mockHorizonFail(new Error('ECONNREFUSED'));
 
     const res = await request(app).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
+    expect(res.body.status).toBe('unhealthy');
     expect(res.body.checks.database.status).toBe('unhealthy');
-    expect(res.body.checks.stellar.status).toBe('unhealthy');
+    expect(res.body.checks.stellar.status).toBe('unreachable');
   });
 
   test('response always contains timestamp, checks.database, and checks.stellar', async () => {
     database.healthCheck.mockResolvedValue({ healthy: true, latency: 1, readyState: 1 });
-    stellarConfig.server.serverInfo.mockResolvedValue({});
+    mockHorizonOk();
 
     const res = await request(app).get('/health');
 
@@ -219,11 +244,13 @@ describe('GET /health', () => {
     expect(res.body.checks).toHaveProperty('stellar');
     expect(res.body.checks.stellar).toHaveProperty('network');
     expect(res.body.checks.stellar).toHaveProperty('horizonUrl');
+    expect(res.body.checks.stellar).toHaveProperty('activeEndpoint');
+    expect(res.body.checks.stellar).toHaveProperty('endpoints');
   });
 
   test('stellar check includes latency_ms on success', async () => {
     database.healthCheck.mockResolvedValue({ healthy: true, latency: 2, readyState: 1 });
-    stellarConfig.server.serverInfo.mockResolvedValue({});
+    mockHorizonOk();
 
     const res = await request(app).get('/health');
 
@@ -233,7 +260,7 @@ describe('GET /health', () => {
 
   test('stellar check includes latency_ms and error on failure', async () => {
     database.healthCheck.mockResolvedValue({ healthy: true, latency: 2, readyState: 1 });
-    stellarConfig.server.serverInfo.mockRejectedValue(new Error('timeout'));
+    mockHorizonFail(new Error('timeout'));
 
     const res = await request(app).get('/health');
 
@@ -244,12 +271,26 @@ describe('GET /health', () => {
 
   test('database.healthCheck rejection is handled gracefully', async () => {
     database.healthCheck.mockRejectedValue(new Error('unexpected DB crash'));
-    stellarConfig.server.serverInfo.mockResolvedValue({});
+    mockHorizonOk();
 
     const res = await request(app).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
+    expect(res.body.status).toBe('unhealthy');
     expect(res.body.checks.database.status).toBe('unhealthy');
+  });
+
+  test('health response includes circuit breaker endpoint list', async () => {
+    database.healthCheck.mockResolvedValue({ healthy: true, latency: 2, readyState: 1 });
+    mockHorizonOk();
+
+    const res = await request(app).get('/health');
+
+    expect(Array.isArray(res.body.checks.stellar.endpoints)).toBe(true);
+    expect(res.body.checks.stellar.endpoints.length).toBeGreaterThan(0);
+    const ep = res.body.checks.stellar.endpoints[0];
+    expect(ep).toHaveProperty('url');
+    expect(ep).toHaveProperty('circuitBreaker');
+    expect(ep.circuitBreaker).toHaveProperty('state');
   });
 });

@@ -1,7 +1,7 @@
 'use strict';
 
 const database = require('../config/database');
-const { server } = require('../config/stellarConfig');
+const { horizonClient } = require('../config/stellarConfig');
 const config = require('../config');
 const { concurrentPaymentProcessor } = require('../services/concurrentPaymentProcessor');
 const { getReminderStatus } = require('../services/reminderService');
@@ -17,10 +17,25 @@ async function checkStellar() {
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error(`Horizon did not respond within ${STELLAR_CHECK_TIMEOUT_MS}ms`)), STELLAR_CHECK_TIMEOUT_MS)
     );
-    await Promise.race([server.ledgers().limit(1).call(), timeoutPromise]);
-    return { status: 'ok', latencyMs: Date.now() - start };
+    // Use horizonClient.call() so the health probe itself benefits from failover
+    await Promise.race([
+      horizonClient.call((server) => server.ledgers().limit(1).call()),
+      timeoutPromise,
+    ]);
+    return {
+      status: 'ok',
+      latencyMs: Date.now() - start,
+      activeUrl: horizonClient.activeUrl,
+      endpoints: horizonClient.getCircuitBreakerStatus(),
+    };
   } catch (err) {
-    return { status: 'unreachable', error: err.message, latencyMs: Date.now() - start };
+    return {
+      status: 'unreachable',
+      error: err.message,
+      latencyMs: Date.now() - start,
+      activeUrl: horizonClient.activeUrl,
+      endpoints: horizonClient.getCircuitBreakerStatus(),
+    };
   }
 }
 
@@ -92,7 +107,9 @@ async function healthCheck(req, res) {
         ...(stellar.latencyMs !== undefined && { latency_ms: stellar.latencyMs }),
         ...(stellar.error && { error: stellar.error }),
         network: config.STELLAR_NETWORK,
-        horizonUrl: config.HORIZON_URL,
+        horizonUrl: stellar.activeUrl || config.HORIZON_URL,
+        activeEndpoint: stellar.activeUrl || config.HORIZON_URL,
+        endpoints: stellar.endpoints || [],
       },
       paymentProcessor: {
         queueDepth,

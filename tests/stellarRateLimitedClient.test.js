@@ -40,6 +40,7 @@ jest.mock('@stellar/stellar-sdk', () => {
 // Prevent real config loading side-effects
 jest.mock('../backend/src/config', () => ({
   HORIZON_URL: 'https://horizon-testnet.stellar.org',
+  STELLAR_HORIZON_URLS: ['https://horizon-testnet.stellar.org'],
   IS_TESTNET: true,
 }));
 
