@@ -7,38 +7,87 @@ const Student = require("../models/studentModel");
 const Payment = require("../models/paymentModel");
 const PaymentIntent = require("../models/paymentIntentModel");
 const { sendPaymentWebhook } = require("./webhookService");
+const { deriveIdempotencyKey } = require("../utils/idempotencyKey");
+const idempotencyStore = require("./idempotencyStore");
+
+// Scope under which the processor namespaces its idempotency keys. Distinct
+// from any HTTP middleware scope (request path) so the two layers never collide
+// in the shared persistent store — while still deriving keys through the same
+// canonical function, so they cannot disagree about what a given client key
+// means.
+const PROCESSOR_SCOPE = "payment-processor";
+
+// Reconstruct a PaymentProcessingResult from a persisted JSON body so replayed
+// results behave like freshly produced ones (`.success`, `.toJSON()`).
+function rehydrateResult(body) {
+  if (!body) return null;
+  const result = new PaymentProcessingResult(
+    Boolean(body.success),
+    body.data || {},
+    body.error || null
+  );
+  if (body.timestamp) result.timestamp = body.timestamp;
+  return result;
+}
 
 // ── Idempotency Cache ─────────────────────────────────────────────────────────
+// Demoted to a pure read-through cache of the persistent `idempotencyStore`.
+// The persistent store (Mongo, optionally fronted by Redis) is the single
+// source of truth and survives restarts / spans replicas; this in-process Map
+// is only an L1 to skip a store round-trip within the TTL window.
 class IdempotencyCache {
-  constructor(ttlMs = 60000) {
-    this.cache = new Map();
+  constructor(ttlMs = 60000, store = idempotencyStore) {
+    this.l1 = new Map();
     this.ttlMs = ttlMs;
+    this.store = store;
+    this.scope = PROCESSOR_SCOPE;
   }
 
-  has(key) {
-    const entry = this.cache.get(key);
-    if (!entry) return false;
+  _l1Get(canonicalKey) {
+    const entry = this.l1.get(canonicalKey);
+    if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
-      this.cache.delete(key);
-      return false;
+      this.l1.delete(canonicalKey);
+      return null;
     }
-    return true;
+    return entry.result;
   }
 
-  get(key) {
-    if (!this.has(key)) return null;
-    return this.cache.get(key).result;
+  // Returns a cached PaymentProcessingResult or null. The persistent store is
+  // authoritative; the L1 is consulted first only as an optimization.
+  async get(rawKey) {
+    const canonicalKey = deriveIdempotencyKey(rawKey, this.scope);
+    if (!canonicalKey) return null;
+
+    const local = this._l1Get(canonicalKey);
+    if (local) return local;
+
+    const record = await this.store.get(canonicalKey);
+    if (!record) return null;
+
+    const result = rehydrateResult(record.responseBody);
+    this.l1.set(canonicalKey, { result, expiresAt: Date.now() + this.ttlMs });
+    return result;
   }
 
-  set(key, result) {
-    this.cache.set(key, { result, expiresAt: Date.now() + this.ttlMs });
-    if (this.cache.size % 100 === 0) this.cleanup();
+  async set(rawKey, result) {
+    const canonicalKey = deriveIdempotencyKey(rawKey, this.scope);
+    if (!canonicalKey) return;
+
+    this.l1.set(canonicalKey, { result, expiresAt: Date.now() + this.ttlMs });
+    if (this.l1.size % 100 === 0) this.cleanup();
+
+    await this.store.set(canonicalKey, {
+      scope: this.scope,
+      responseStatus: 200,
+      responseBody: result.toJSON ? result.toJSON() : result,
+    });
   }
 
   cleanup() {
     const now = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (now > entry.expiresAt) this.cache.delete(key);
+    for (const [key, entry] of this.l1.entries()) {
+      if (now > entry.expiresAt) this.l1.delete(key);
     }
   }
 }
@@ -146,12 +195,16 @@ class ConcurrentPaymentProcessor {
       );
     }
 
-    // Idempotency check
-    if (idempotencyKey && this.idempotencyCache.has(idempotencyKey)) {
-      logger.info("[PaymentProcessor] Returning cached result", {
-        idempotencyKey,
-      });
-      return this.idempotencyCache.get(idempotencyKey);
+    // Idempotency check — persistent store is the source of truth, so a replay
+    // is recognized even after a restart or on another replica.
+    if (idempotencyKey) {
+      const cached = await this.idempotencyCache.get(idempotencyKey);
+      if (cached) {
+        logger.info("[PaymentProcessor] Returning persisted idempotent result", {
+          idempotencyKey,
+        });
+        return cached;
+      }
     }
 
     // Rate limit check
@@ -178,7 +231,7 @@ class ConcurrentPaymentProcessor {
           duplicate: true,
           existingPaymentId: existingPayment._id,
         });
-        if (idempotencyKey) this.idempotencyCache.set(idempotencyKey, result);
+        if (idempotencyKey) await this.idempotencyCache.set(idempotencyKey, result);
         return result;
       }
 
@@ -213,7 +266,7 @@ class ConcurrentPaymentProcessor {
 
       // Cache success
       if (idempotencyKey && processingResult.success)
-        this.idempotencyCache.set(idempotencyKey, processingResult);
+        await this.idempotencyCache.set(idempotencyKey, processingResult);
 
       // Trigger webhook (non-blocking)
       this.triggerWebhook(
@@ -542,7 +595,7 @@ class ConcurrentPaymentProcessor {
   // ── Stats ───────────────────────────────────────────────────────────────
   getStats() {
     return {
-      idempotencyCacheSize: this.idempotencyCache.cache.size,
+      idempotencyCacheSize: this.idempotencyCache.l1.size,
       rateLimiterStats: { trackedKeys: this.rateLimiter.requests.size },
       transactionManagerStats: {
         activeTransactions: transactionManager.getActiveTransactionCount(),
