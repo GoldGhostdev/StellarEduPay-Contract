@@ -2,7 +2,7 @@
 
 // Must set required env vars before app is loaded
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-secret';
 
 const request = require('supertest');
@@ -52,7 +52,7 @@ jest.mock('../backend/src/models/schoolModel', () => ({
   findOne: jest.fn().mockReturnValue({
     lean: jest.fn().mockResolvedValue({
       schoolId: 'SCH001', name: 'Test School', slug: 'test-school',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD', isActive: true,
     }),
   }),

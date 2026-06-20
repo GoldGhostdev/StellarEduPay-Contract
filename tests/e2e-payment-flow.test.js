@@ -21,7 +21,7 @@
 
 // ─── Environment ──────────────────────────────────────────────────────────────
 process.env.MONGO_URI             = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET            = 'test-jwt-secret-e2e-payment-flow';
 
 // ─── Mocks (jest hoists these before any require) ─────────────────────────────
@@ -37,7 +37,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
 
 // Stellar config — provides wallet address and mocked Horizon server.
 jest.mock('../backend/src/config/stellarConfig', () => ({
-  SCHOOL_WALLET:        'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+  SCHOOL_WALLET:        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
   networkPassphrase:    'Test SDF Network ; September 2015',
   CONFIRMATION_THRESHOLD: 1,
   ACCEPTED_ASSETS: {
@@ -179,7 +179,7 @@ const {
 // ─── Constants ────────────────────────────────────────────────────────────────
 const SCHOOL_ID   = 'SCH001';
 const STUDENT_ID  = 'STU-E2E';
-const WALLET_ADDR = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+const WALLET_ADDR = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 const VALID_HASH  = 'a'.repeat(64);
 const DUP_HASH    = 'b'.repeat(64);
 const OVER_HASH   = 'c'.repeat(64);

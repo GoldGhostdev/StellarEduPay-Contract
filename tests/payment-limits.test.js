@@ -41,14 +41,14 @@ describe('Payment Limits', () => {
     it('should reject zero payment amounts', () => {
       const result = validatePaymentAmount(0);
       expect(result.valid).toBe(false);
-      expect(result.error).toContain('greater than zero');
+      expect(result.error).toContain('valid positive number');
       expect(result.code).toBe('INVALID_AMOUNT');
     });
 
     it('should reject negative payment amounts', () => {
       const result = validatePaymentAmount(-10);
       expect(result.valid).toBe(false);
-      expect(result.error).toContain('greater than zero');
+      expect(result.error).toContain('valid positive number');
       expect(result.code).toBe('INVALID_AMOUNT');
     });
 

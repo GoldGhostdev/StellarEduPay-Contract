@@ -16,7 +16,7 @@
 const TEST_KEY = 'a'.repeat(64); // 32 bytes of 0xaa — valid for testing
 process.env.MEMO_ENCRYPTION_KEY = TEST_KEY;
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 const { encryptMemo, decryptMemo, isEncryptionEnabled } = require('../backend/src/utils/memoEncryption');
 

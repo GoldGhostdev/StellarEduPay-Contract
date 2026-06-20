@@ -6,7 +6,7 @@
 
 // Set required env vars
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-secret';
 
 // Mock payment model
@@ -46,7 +46,7 @@ jest.mock('../backend/src/services/stellarService', () => ({}));
 jest.mock('../backend/src/services/retryService', () => ({}));
 jest.mock('../backend/src/queue/transactionQueue', () => ({}));
 jest.mock('../backend/src/config/stellarConfig', () => ({
-  SCHOOL_WALLET: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+  SCHOOL_WALLET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
   ACCEPTED_ASSETS: {},
 }));
 jest.mock('../backend/src/utils/hashValidator', () => ({}));

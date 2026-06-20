@@ -22,7 +22,7 @@ jobs:
       MONGO_URI: mongodb://localhost:27017/stellaredupay_test
       # Dummy secrets required by config/index.js validation before test files can set them.
       JWT_SECRET: ci-test-jwt-secret-not-used-in-production
-      SCHOOL_WALLET_ADDRESS: GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B
+      SCHOOL_WALLET_ADDRESS: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 
     services:
       mongodb:

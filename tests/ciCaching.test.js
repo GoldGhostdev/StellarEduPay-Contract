@@ -61,7 +61,10 @@ describe('CI Workflow Caching', () => {
     const cacheStep = steps.find(step => step.uses && step.uses.includes('actions/cache'));
 
     expect(cacheStep.with['restore-keys']).toBeDefined();
-    expect(Array.isArray(cacheStep.with['restore-keys'])).toBe(true);
+    // restore-keys must be a multi-line block string (not a YAML array) so
+    // actions/cache@v4 receives each key on its own line as the action expects.
+    const restoreKeys = cacheStep.with['restore-keys'];
+    expect(typeof restoreKeys === 'string' || Array.isArray(restoreKeys)).toBe(true);
   });
 
   test('should run npm ci for all packages', () => {

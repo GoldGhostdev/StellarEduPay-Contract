@@ -24,7 +24,7 @@ jest.mock('../backend/src/services/stellarAccountVerificationService', () => ({
 const School = require('../backend/src/models/schoolModel');
 
 // Valid Stellar public key for tests
-const VALID_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+const VALID_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

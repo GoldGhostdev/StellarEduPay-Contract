@@ -1,7 +1,7 @@
 'use strict';
 
 const WebhookRetry = require('../models/webhookRetryModel');
-const logger = require('../utils/logger').child('WebhookAdminController');
+const logger = require('../utils/logger');
 
 /**
  * GET /api/admin/webhooks/dlq

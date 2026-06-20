@@ -1,7 +1,7 @@
 'use strict';
 
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-jwt-secret-multi-asset';
 
 const request = require('supertest');
@@ -23,7 +23,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
     _id: 'sch-001',
     slug: 'test-school',
     name: 'Test School',
-    stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+    stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
     acceptedAssets: ['XLM', 'USDC'],
     save: jest.fn().mockResolvedValue(true),
   };
@@ -81,7 +81,7 @@ describe('Multi-Asset Support (#675)', () => {
           records: [
             {
               type: 'payment',
-              to: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
               asset_type: 'native',
               amount: '250',
             },
@@ -92,7 +92,7 @@ describe('Multi-Asset Support (#675)', () => {
       const stellarService = require('../backend/src/services/stellarService');
       const result = await stellarService.extractValidPayment(
         mockTx,
-        'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B'
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'
       );
 
       expect(result).toBeDefined();
@@ -109,7 +109,7 @@ describe('Multi-Asset Support (#675)', () => {
           records: [
             {
               type: 'payment',
-              to: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
               asset_type: 'credit_alphanum4',
               asset_code: 'USDC',
               asset_issuer: 'GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABZEYYWRB46Z7',
@@ -122,7 +122,7 @@ describe('Multi-Asset Support (#675)', () => {
       const stellarService = require('../backend/src/services/stellarService');
       const result = await stellarService.extractValidPayment(
         mockTx,
-        'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B'
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'
       );
 
       expect(result).toBeDefined();
@@ -139,7 +139,7 @@ describe('Multi-Asset Support (#675)', () => {
           records: [
             {
               type: 'payment',
-              to: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
               asset_type: 'credit_alphanum12',
               asset_code: 'UNSUPPORTED',
               asset_issuer: 'GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABZEYYWRB46Z7',
@@ -152,7 +152,7 @@ describe('Multi-Asset Support (#675)', () => {
       const stellarService = require('../backend/src/services/stellarService');
       const result = await stellarService.extractValidPayment(
         mockTx,
-        'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B'
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'
       );
 
       expect(result).toBeNull();
@@ -236,7 +236,7 @@ describe('Multi-Asset Support (#675)', () => {
         .send({
           name: 'New School',
           slug: 'new-school',
-          stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+          stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
           acceptedAssets: ['XLM', 'USDC'],
         })
         .expect(201);
@@ -252,7 +252,7 @@ describe('Multi-Asset Support (#675)', () => {
         .send({
           name: 'New School',
           slug: 'new-school',
-          stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+          stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
           acceptedAssets: ['XLM', 'UNSUPPORTED'],
         })
         .expect(400);
@@ -267,7 +267,7 @@ describe('Multi-Asset Support (#675)', () => {
         .send({
           name: 'New School',
           slug: 'new-school',
-          stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+          stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
         })
         .expect(201);
 

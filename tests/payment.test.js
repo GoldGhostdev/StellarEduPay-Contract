@@ -2,7 +2,7 @@
 
 // Must set required env vars before app is loaded (config/index.js validates on require)
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-jwt-secret-for-payment-controller-suite';
 
 const request = require('supertest');
@@ -152,7 +152,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH001',
       name: 'Test School',
       slug: 'test-school',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -160,7 +160,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH_A',
       name: 'School A',
       slug: 'school-a',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -168,7 +168,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH_B',
       name: 'School B',
       slug: 'school-b',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -222,7 +222,7 @@ jest.mock('../backend/src/services/currencyConversionService', () => ({
 }));
 
 jest.mock('../backend/src/config/stellarConfig', () => ({
-  SCHOOL_WALLET: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+  SCHOOL_WALLET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
   ACCEPTED_ASSETS: {
     XLM:  { code: 'XLM',  type: 'native',          issuer: null },
     USDC: { code: 'USDC', type: 'credit_alphanum4', issuer: 'GISSUER' },

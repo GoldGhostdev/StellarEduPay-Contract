@@ -7,7 +7,7 @@
 
 // Set required env vars before loading modules
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 const request = require('supertest');
 
@@ -69,7 +69,7 @@ describe('Payment Verification Idempotency', () => {
     // Default school mock
     School.findOne.mockResolvedValue({
       schoolId: 'SCH001',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
     });
   });
@@ -139,7 +139,7 @@ describe('Payment Verification Idempotency', () => {
       // Verify Horizon was called
       expect(verifyTransaction).toHaveBeenCalledWith(
         txHash,
-        'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B'
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'
       );
     });
   });

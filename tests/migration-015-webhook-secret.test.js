@@ -1,20 +1,31 @@
 'use strict';
 
 const mongoose = require('mongoose');
-const { MongoMemoryServer } = require('mongodb-memory-server');
 const migration = require('../backend/migrations/015_add_school_webhook_secret');
+
+// In CI a real MongoDB service is available via MONGO_URI — use it directly to
+// avoid MongoMemoryServer downloading a binary (blocked by blockRealHttp.js).
+const USE_EXTERNAL_MONGO = !!process.env.MONGO_URI;
+const TEST_DB = 'migration_015_test';
 
 describe('Migration 015 — Add webhookSecret to schools', () => {
   let mongoServer;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
-    await mongoose.connect(mongoServer.getUri());
+    if (USE_EXTERNAL_MONGO) {
+      const baseUri = process.env.MONGO_URI.replace(/\/[^/?]+(\?|$)/, `/${TEST_DB}$1`);
+      await mongoose.connect(baseUri);
+    } else {
+      const { MongoMemoryServer } = require('mongodb-memory-server');
+      mongoServer = await MongoMemoryServer.create();
+      await mongoose.connect(mongoServer.getUri());
+    }
   });
 
   afterAll(async () => {
+    await mongoose.connection.db.dropDatabase();
     await mongoose.disconnect();
-    await mongoServer.stop();
+    if (mongoServer) await mongoServer.stop();
   });
 
   beforeEach(async () => {

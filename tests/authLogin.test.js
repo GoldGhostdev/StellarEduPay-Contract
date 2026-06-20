@@ -81,14 +81,17 @@ describe('handleLogin', () => {
 });
 
 describe('config — JWT_SECRET enforcement', () => {
-  it('throws a clear error when JWT_SECRET is missing', () => {
-    const saved = process.env.JWT_SECRET;
+  it('throws a clear error when JWT_SECRET is missing in production', () => {
+    const savedSecret = process.env.JWT_SECRET;
+    const savedEnv = process.env.NODE_ENV;
     delete process.env.JWT_SECRET;
+    process.env.NODE_ENV = 'production';
     expect(() => {
       jest.isolateModules(() => {
         require('../backend/src/config/index.js');
       });
     }).toThrow(/JWT_SECRET/);
-    process.env.JWT_SECRET = saved;
+    process.env.JWT_SECRET = savedSecret;
+    process.env.NODE_ENV = savedEnv;
   });
 });
