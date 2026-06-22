@@ -63,8 +63,15 @@ jest.mock('../backend/src/services/stellarService', () => ({
   }),
   validatePaymentAgainstFee: jest.fn().mockReturnValue({ status: 'valid', message: 'ok' }),
   detectMemoCollision: jest.fn().mockResolvedValue({ suspicious: false, reason: null }),
+  detectCrossSchoolMemoCollision: jest.fn().mockResolvedValue({ suspicious: false, reason: null }),
   detectAbnormalPatterns: jest.fn().mockResolvedValue({ suspicious: false, reason: null }),
   checkConfirmationStatus: jest.fn().mockResolvedValue(true),
+  determineConfirmationState: jest.fn().mockResolvedValue({
+    state: 'confirmed',
+    changed: true,
+    confirmationStatus: 'confirmed',
+    latestLedgerSequence: 44,
+  }),
 }));
 
 jest.mock('../backend/src/utils/paymentLimits', () => ({
@@ -198,8 +205,13 @@ describe('processTransaction – atomicity', () => {
   });
 
   test('Student.findOneAndUpdate is skipped when payment is not confirmed', async () => {
-    const { checkConfirmationStatus } = require('../backend/src/services/stellarService');
-    checkConfirmationStatus.mockResolvedValueOnce(false); // not confirmed
+    const { determineConfirmationState } = require('../backend/src/services/stellarService');
+    determineConfirmationState.mockResolvedValueOnce({
+      state: 'pending',
+      changed: true,
+      confirmationStatus: 'pending_confirmation',
+      latestLedgerSequence: 43,
+    }); // not confirmed
 
     await processTransaction(makeTx(), makeSchool());
 

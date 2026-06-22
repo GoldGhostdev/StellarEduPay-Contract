@@ -12,12 +12,13 @@ const paymentEvents = require("../events/paymentEvents");
  */
 async function savePayment(data) {
   const exists = await Payment.findOne({
-    transactionHash: data.transactionHash,
+    schoolId: data.schoolId,
+    txHash: data.txHash,
     deletedAt: null,
   });
   if (exists) {
     const err = new Error(
-      `Transaction ${data.transactionHash} has already been processed`,
+      `Transaction ${data.txHash} has already been processed`,
     );
     err.code = "DUPLICATE_TX";
     throw err;
@@ -37,6 +38,7 @@ async function savePayment(data) {
       err.code = "DUPLICATE_TX";
       logger.warn("Duplicate transaction rejected", {
         txHash: data.transactionHash,
+        correlationId: data.correlationId,
         schoolId: data.schoolId,
       });
       throw err;
@@ -44,6 +46,7 @@ async function savePayment(data) {
     logger.error("Failed to record payment", {
       error: e.message,
       txHash: data.transactionHash,
+      correlationId: data.correlationId,
       schoolId: data.schoolId,
     });
     throw e;

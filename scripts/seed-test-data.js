@@ -21,7 +21,12 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '../backend/
 // Patch env so config/index.js validation passes when models are loaded
 process.env.SCHOOL_WALLET_ADDRESS = process.env.SCHOOL_WALLET_ADDRESS || 'PLACEHOLDER';
 
-const mongoose = require('mongoose');
+// Root and backend pin different mongoose majors in separate node_modules
+// trees. A plain require('mongoose') here resolves to the root copy, which is
+// a different singleton than the one FeeStructure/Student are bound to —
+// mongoose.connect() below would then never open *their* connection, and every
+// query buffers until it times out ("buffering timeout" — see issue #749).
+const mongoose = require('../backend/node_modules/mongoose');
 const FeeStructure = require('../backend/src/models/feeStructureModel');
 const Student = require('../backend/src/models/studentModel');
 

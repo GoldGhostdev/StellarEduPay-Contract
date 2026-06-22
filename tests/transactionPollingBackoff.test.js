@@ -47,8 +47,15 @@ jest.mock('../backend/src/services/stellarService', () => ({
   extractValidPayment: jest.fn().mockResolvedValue(null),
   validatePaymentAgainstFee: jest.fn().mockReturnValue({ status: 'valid' }),
   detectMemoCollision: jest.fn().mockResolvedValue({ suspicious: false }),
+  detectCrossSchoolMemoCollision: jest.fn().mockResolvedValue({ suspicious: false }),
   detectAbnormalPatterns: jest.fn().mockResolvedValue({ suspicious: false }),
   checkConfirmationStatus: jest.fn().mockResolvedValue(true),
+  determineConfirmationState: jest.fn().mockResolvedValue({
+    state: 'confirmed',
+    changed: true,
+    confirmationStatus: 'confirmed',
+    latestLedgerSequence: 1,
+  }),
 }));
 jest.mock('../backend/src/services/sseService', () => ({ emit: jest.fn() }));
 jest.mock('../backend/src/utils/paymentLimits', () => ({

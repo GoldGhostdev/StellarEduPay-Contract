@@ -67,6 +67,21 @@ const CONFIRMATION_THRESHOLD = parseInt(
   process.env.CONFIRMATION_THRESHOLD || "2",
   10,
 );
+
+// Finality threshold (issue #747): ledgers required beyond CONFIRMATION_THRESHOLD
+// before a payment is promoted from 'confirmed' to 'finalized' — the point at
+// which it is treated as practically irreversible and should never require
+// manual correction. Must be >= CONFIRMATION_THRESHOLD; defaults to 5x it.
+const FINALIZATION_THRESHOLD = parseInt(
+  process.env.FINALIZATION_THRESHOLD || String(CONFIRMATION_THRESHOLD * 5),
+  10,
+);
+if (FINALIZATION_THRESHOLD < CONFIRMATION_THRESHOLD) {
+  throw new Error(
+    "[Config] FINALIZATION_THRESHOLD must be >= CONFIRMATION_THRESHOLD.",
+  );
+}
+
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 
 // SYNC_INTERVAL_MS is the canonical env var for auto-sync interval.
@@ -173,6 +188,7 @@ const config = Object.freeze({
   USDC_ISSUER,
   ACCEPTED_ASSET,
   CONFIRMATION_THRESHOLD,
+  FINALIZATION_THRESHOLD,
   POLL_INTERVAL_MS,
   SYNC_INTERVAL_MS,
   SYNC_LOCK_TTL_MS,

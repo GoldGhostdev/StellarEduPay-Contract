@@ -138,7 +138,7 @@ async function createPaymentIntent(req, res, next) {
       amount: feeAmount,
       feeCategory: feeCategory || null,
       memo,
-      status: 'PENDING',
+      status: 'pending',
       expiresAt: new Date(Date.now() + ttlMs),
       startedAt: new Date(),
     });

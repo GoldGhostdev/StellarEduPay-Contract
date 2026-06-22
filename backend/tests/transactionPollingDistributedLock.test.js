@@ -94,8 +94,15 @@ jest.mock('../src/services/stellarService', () => ({
   extractValidPayment: async () => ({ payOp: { amount: '50', from: 'GSENDER' }, memo: 's1', asset: 'XLM' }),
   validatePaymentAgainstFee: () => ({ valid: true }),
   detectMemoCollision: async () => ({ suspicious: false, reason: null }),
+  detectCrossSchoolMemoCollision: async () => ({ suspicious: false, reason: null }),
   detectAbnormalPatterns: async () => ({ suspicious: false, reason: null }),
   checkConfirmationStatus: async () => true,
+  determineConfirmationState: async () => ({
+    state: 'confirmed',
+    changed: true,
+    confirmationStatus: 'confirmed',
+    latestLedgerSequence: 102,
+  }),
 }));
 
 jest.mock('../src/utils/paymentLimits', () => ({

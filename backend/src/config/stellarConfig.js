@@ -87,6 +87,7 @@ function resolveAsset(assetCode) {
 }
 
 const CONFIRMATION_THRESHOLD = config.CONFIRMATION_THRESHOLD;
+const FINALIZATION_THRESHOLD = config.FINALIZATION_THRESHOLD;
 
 module.exports = {
   server,
@@ -96,6 +97,7 @@ module.exports = {
   StellarSdk,
   ACCEPTED_ASSETS,
   CONFIRMATION_THRESHOLD,
+  FINALIZATION_THRESHOLD,
   isAcceptedAsset,
   resolveAsset,
 };

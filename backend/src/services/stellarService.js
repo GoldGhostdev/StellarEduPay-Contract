@@ -5,6 +5,7 @@ const {
   server,
   isAcceptedAsset,
   CONFIRMATION_THRESHOLD,
+  FINALIZATION_THRESHOLD,
 } = require("../config/stellarConfig");
 const Payment = require("../models/paymentModel");
 const Student = require("../models/studentModel");
@@ -12,6 +13,7 @@ const PaymentIntent = require("../models/paymentIntentModel");
 const { validatePaymentAmount } = require("../utils/paymentLimits");
 const { withStellarRetry } = require("../utils/withStellarRetry");
 const { savePayment } = require("./transactionService");
+const { deriveCorrelationId } = require("../utils/correlationId");
 const logger = require("../utils/logger").child("StellarService");
 
 function detectAsset(payOp) {
@@ -116,13 +118,57 @@ function validatePaymentAgainstFee(paymentAmount, expectedFee) {
   };
 }
 
-async function checkConfirmationStatus(txLedger) {
+async function getLatestLedgerSequence(label) {
   const latestLedger = await withStellarRetry(
     () => server.ledgers().order("desc").limit(1).call(),
-    { label: "checkConfirmationStatus" },
+    { label },
   );
-  const latestSequence = latestLedger.records[0].sequence;
+  return latestLedger.records[0].sequence;
+}
+
+async function checkConfirmationStatus(txLedger) {
+  const latestSequence = await getLatestLedgerSequence(
+    "checkConfirmationStatus",
+  );
   return latestSequence - txLedger >= CONFIRMATION_THRESHOLD;
+}
+
+/**
+ * Determine the next confirmation state for a payment per the finality
+ * policy (issue #747). Fetches the latest Horizon ledger sequence, computes
+ * the state the ledger depth + suspicion flag implies, then resolves it
+ * against the payment's current state via the idempotent/monotonic state
+ * machine — re-running this with the same inputs (e.g. a re-poll of the same
+ * ledger range) always yields the same result and never regresses a payment.
+ *
+ * @param {number|null} txLedger - ledger sequence the tx was included in
+ * @param {string} [currentState] - payment's current confirmationState (defaults to 'detected')
+ * @param {boolean} [isSuspicious] - fraud/anomaly signal
+ * @returns {Promise<{ state: string, changed: boolean, confirmationStatus: string, latestLedgerSequence: number }>}
+ */
+async function determineConfirmationState(
+  txLedger,
+  currentState = CONFIRMATION_STATES.DETECTED,
+  isSuspicious = false,
+) {
+  const latestLedgerSequence = await getLatestLedgerSequence(
+    "determineConfirmationState",
+  );
+  const targetState = computeTargetState({
+    txLedger,
+    latestLedgerSequence,
+    isSuspicious,
+    confirmationThreshold: CONFIRMATION_THRESHOLD,
+    finalizationThreshold: FINALIZATION_THRESHOLD,
+  });
+  const { state, changed } = resolveNextState(currentState, targetState);
+
+  return {
+    state,
+    changed,
+    confirmationStatus: deriveLegacyConfirmationStatus(state),
+    latestLedgerSequence,
+  };
 }
 
 /**
@@ -143,7 +189,7 @@ async function detectMemoCollision(
 
   const recentFromOtherSender = await Payment.findOne({
     schoolId,
-    studentId: memo,
+    memo,
     senderAddress: { $ne: senderAddress, $exists: true, $ne: null },
     confirmedAt: { $gte: windowStart },
     deletedAt: null,
@@ -157,6 +203,45 @@ async function detectMemoCollision(
         memo +
         '" was used by a different sender (' +
         recentFromOtherSender.senderAddress +
+        ") within the last 24 hours",
+    };
+  }
+
+  return { suspicious: false, reason: null };
+}
+
+/**
+ * Detect memo collision across schools: the same memo (student ID) was
+ * recorded as a confirmed payment for a *different* school within the last
+ * 24 hours. Memos are only unique within a school's own student roster
+ * (`Student.studentId` is school-scoped), so two unrelated schools can
+ * legitimately assign the same ID to different students — but a payment
+ * landing under that ID at two schools in a short window is worth flagging
+ * for manual review rather than silently trusting both.
+ *
+ * Deliberately independent of `detectMemoCollision` (which is single-school,
+ * sender-based) — this is the cross-school signal the original function
+ * explicitly does not cover.
+ */
+async function detectCrossSchoolMemoCollision(memo, schoolId, txDate) {
+  const COLLISION_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const windowStart = new Date(txDate.getTime() - COLLISION_WINDOW_MS);
+
+  const recentFromOtherSchool = await Payment.findOne({
+    schoolId: { $ne: schoolId },
+    studentId: memo,
+    confirmedAt: { $gte: windowStart },
+    deletedAt: null,
+  });
+
+  if (recentFromOtherSchool) {
+    return {
+      suspicious: true,
+      reason:
+        'Memo "' +
+        memo +
+        '" was also used for a payment to a different school (' +
+        recentFromOtherSchool.schoolId +
         ") within the last 24 hours",
     };
   }
@@ -467,12 +552,6 @@ async function syncPaymentsForSchool(school) {
       const senderAddress = payOp.from || null;
       const txDate = new Date(tx.created_at);
       const txLedger = tx.ledger_attr || tx.ledger || null;
-      const isConfirmed = txLedger
-        ? await checkConfirmationStatus(txLedger)
-        : false;
-      const confirmationStatus = isConfirmed
-        ? "confirmed"
-        : "pending_confirmation";
 
       const collision = await detectMemoCollision(
         memo,
@@ -482,6 +561,22 @@ async function syncPaymentsForSchool(school) {
         txDate,
         schoolId,
       );
+      const crossSchoolCollision = await detectCrossSchoolMemoCollision(
+        memo,
+        schoolId,
+        txDate,
+      );
+      const isSuspicious = collision.suspicious || crossSchoolCollision.suspicious;
+      const suspicionReason =
+        [collision.reason, crossSchoolCollision.reason].filter(Boolean).join('; ') || null;
+
+      const confirmation = await determineConfirmationState(
+        txLedger,
+        CONFIRMATION_STATES.DETECTED,
+        isSuspicious,
+      );
+      const isConfirmed = isConfirmedOrAbove(confirmation.state);
+      const confirmationStatus = confirmation.confirmationStatus;
 
       const previousPayments = await Payment.aggregate([
         { $match: { schoolId, studentId: intent.studentId, deletedAt: null } },
@@ -514,18 +609,21 @@ async function syncPaymentsForSchool(school) {
         schoolId,
         studentId: intent.studentId,
         txHash: tx.hash,
+        correlationId: deriveCorrelationId(tx.hash),
         amount: paymentAmount,
         feeAmount: intent.amount,
         feeCategory: intent.feeCategory || null,
         feeValidationStatus: cumulativeStatus,
         excessAmount,
-        status: "confirmed",
+        status: "SUCCESS",
         memo,
         senderAddress,
-        isSuspicious: collision.suspicious,
-        suspicionReason: collision.reason,
+        isSuspicious,
+        suspicionReason,
         ledger: txLedger,
+        ledgerSequence: txLedger,
         confirmationStatus,
+        confirmationState: confirmation.state,
         confirmedAt: txDate,
       });
       newPayments++;
@@ -536,11 +634,12 @@ async function syncPaymentsForSchool(school) {
         studentId: intent.studentId,
         amount: paymentAmount,
         feeValidationStatus: cumulativeStatus,
-        isSuspicious: collision.suspicious,
+        isSuspicious,
         confirmationStatus,
+        confirmationState: confirmation.state,
       });
 
-      if (isConfirmed && !collision.suspicious) {
+      if (isConfirmed && !isSuspicious) {
         // Update student record
         const updateData = {
           totalPaid: cumulativeTotal,
@@ -603,32 +702,51 @@ async function syncPaymentsForSchool(school) {
   }
 
   return summary;
-  return { newPayments };
 }
 
 /**
- * Re-check all pending_confirmation payments for a school and promote them
- * to confirmed once the ledger threshold has been met.
+ * Re-check all non-terminal payments for a school and advance each one
+ * (detected/pending -> confirmed -> finalized) per the finality policy
+ * (issue #747). Safe to call repeatedly/concurrently for the same school:
+ * `determineConfirmationState` is idempotent, so a re-run over an unchanged
+ * ledger range leaves already-resolved payments untouched.
+ *
+ * Falls back to the legacy `confirmationStatus` field for payments written
+ * before `confirmationState` existed, so older pending records keep getting
+ * swept without a separate migration step.
  *
  * @param {string} schoolId
  */
 async function finalizeConfirmedPayments(schoolId) {
   const pending = await Payment.find({
     schoolId,
-    confirmationStatus: "pending_confirmation",
     isSuspicious: false,
+    $or: [
+      { confirmationState: { $in: [CONFIRMATION_STATES.DETECTED, CONFIRMATION_STATES.PENDING, CONFIRMATION_STATES.CONFIRMED] } },
+      { confirmationState: { $exists: false }, confirmationStatus: "pending_confirmation" },
+    ],
   });
 
   for (const payment of pending) {
-    if (!payment.ledgerSequence) continue;
-    const isConfirmed = await checkConfirmationStatus(payment.ledgerSequence);
-    if (!isConfirmed) continue;
+    const txLedger = payment.ledgerSequence || payment.ledger;
+    if (!txLedger) continue;
+
+    const currentState = payment.confirmationState || CONFIRMATION_STATES.DETECTED;
+    const { state: nextState, changed } = await determineConfirmationState(
+      txLedger,
+      currentState,
+      payment.isSuspicious,
+    );
+    if (!changed) continue;
 
     if (typeof Payment.findByIdAndUpdate === "function") {
       await Payment.findByIdAndUpdate(payment._id, {
-        confirmationStatus: "confirmed",
+        confirmationState: nextState,
+        confirmationStatus: deriveLegacyConfirmationStatus(nextState),
       });
     }
+
+    if (!isConfirmedOrAbove(nextState)) continue;
 
     const student = await Student.findOne({
       schoolId,
@@ -755,6 +873,11 @@ module.exports = {
   normalizeAmount,
   extractValidPayment,
   detectMemoCollision,
+  detectCrossSchoolMemoCollision,
   detectAbnormalPatterns,
   checkConfirmationStatus,
+  // recordPayment was moved to transactionService.savePayment (db layer split);
+  // re-exported under its original name since paymentController, retryService,
+  // transactionQueueService, and transactionRetryQueue still import it from here.
+  recordPayment: savePayment,
 };
