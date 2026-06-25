@@ -21,6 +21,7 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const config = require('../config');
 const logger = require('../utils/logger').child('NotificationService');
+const { generateUnsubscribeToken } = require('../utils/unsubscribeToken');
 
 const TEMPLATES_DIR = path.join(__dirname, '..', 'templates');
 
@@ -85,14 +86,14 @@ async function verifySmtp() {
 /**
  * Build the reminder email body from external template files.
  */
-function buildReminderEmail({ studentName, studentId, className, feeAmount, remainingBalance, schoolName, reminderCount }) {
+function buildReminderEmail({ studentName, studentId, className, feeAmount, remainingBalance, schoolName, reminderCount, unsubscribeUrl }) {
   const outstanding = remainingBalance != null ? remainingBalance : feeAmount;
   const subject = `[${schoolName}] Fee Payment Reminder — ${studentName}`;
   const reminderNote = reminderCount > 1
     ? `Note: This is reminder #${reminderCount}. If you have already paid, please disregard this message.`
     : '';
 
-  const vars = { studentName, studentId, className, feeAmount, outstanding, schoolName, reminderNote };
+  const vars = { studentName, studentId, className, feeAmount, outstanding, schoolName, reminderNote, unsubscribeUrl: unsubscribeUrl || '' };
 
   const text = renderTemplate(loadTemplate('reminderEmail.txt'), vars);
   const html = renderTemplate(loadTemplate('reminderEmail.html'), vars);
@@ -107,6 +108,7 @@ function buildReminderEmail({ studentName, studentId, className, feeAmount, rema
  * @param {string} opts.to            - Parent email address
  * @param {string} opts.studentName
  * @param {string} opts.studentId
+ * @param {string} opts.schoolId      - Required for generating the unsubscribe token
  * @param {string} opts.className
  * @param {number} opts.feeAmount
  * @param {number|null} opts.remainingBalance
@@ -115,7 +117,12 @@ function buildReminderEmail({ studentName, studentId, className, feeAmount, rema
  * @returns {Promise<{sent: boolean, messageId?: string, preview?: string}>}
  */
 async function sendFeeReminder(opts) {
-  const { subject, text, html } = buildReminderEmail(opts);
+  // Generate a signed unsubscribe token for this student/school pair
+  const token = generateUnsubscribeToken(opts.studentId, opts.schoolId || 'unknown', config.JWT_SECRET);
+  const baseUrl = config.APP_URL || process.env.APP_URL || 'http://localhost:5000';
+  const unsubscribeUrl = `${baseUrl}/api/reminders/unsubscribe?token=${encodeURIComponent(token)}`;
+
+  const { subject, text, html } = buildReminderEmail({ ...opts, unsubscribeUrl });
   const transporter = getTransporter();
 
   if (!transporter) {

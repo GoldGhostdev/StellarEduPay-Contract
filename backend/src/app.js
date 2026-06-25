@@ -207,6 +207,14 @@ connectWithRetry().then(async () => {
     logger.error('Stuck payment reconciliation failed on startup', { error: err.message });
   }
 
+  // Recover any pending/processing BullMQ jobs that survived a restart in MongoDB
+  const { recoverPendingJobs } = require('./queue/transactionQueue');
+  try {
+    await recoverPendingJobs();
+  } catch (err) {
+    logger.error('Transaction queue recovery failed on startup', { error: err.message });
+  }
+
   startPolling();
   startConsistencyScheduler();
   retrySelector.start();

@@ -26,6 +26,7 @@ const { Queue, Worker } = require('bullmq');
 const PendingVerification = require('../models/pendingVerificationModel');
 const logger = require('../utils/logger');
 const { resolveCorrelationId } = require('../utils/correlationId');
+const { getRedisClient } = require('../config/redisClient');
 
 const QUEUE_NAME = 'transaction-processing';
 

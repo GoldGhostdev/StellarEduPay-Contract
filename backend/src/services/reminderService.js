@@ -158,6 +158,7 @@ async function processReminders() {
           to:               student.parentEmail,
           studentName:      student.name,
           studentId:        student.studentId,
+          schoolId:         school.schoolId,
           className:        student.class,
           feeAmount:        student.feeAmount,
           remainingBalance,

@@ -12,3 +12,5 @@ Please arrange payment at your earliest convenience to avoid any disruption to y
 
 {{/if}}Thank you,
 {{schoolName}} Administration
+
+{{#if unsubscribeUrl}}To stop receiving these reminders: {{unsubscribeUrl}}{{/if}}
