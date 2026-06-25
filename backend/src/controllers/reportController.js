@@ -4,18 +4,10 @@ const { generateReport, reportToCsv, getDashboardMetrics } = require('../service
 const { get, set, KEYS, TTL } = require('../cache');
 const School = require('../models/schoolModel');
 
-const ISO_8601 = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?Z)?$/;
-
 async function getReport(req, res, next) {
   try {
+    // Date-range validation is handled by the Joi middleware in reportRoutes.
     const { startDate, endDate, format = 'json' } = req.query;
-
-    for (const [name, val] of [['startDate', startDate], ['endDate', endDate]]) {
-      if (val && (!ISO_8601.test(val) || isNaN(Date.parse(val))))
-        return next(Object.assign(new Error(`Invalid ${name} — must be ISO 8601`), { code: 'INVALID_DATE_FORMAT' }));
-    }
-    if (startDate && endDate && new Date(startDate) > new Date(endDate))
-      return next(Object.assign(new Error('startDate must be before or equal to endDate'), { code: 'INVALID_DATE_FORMAT' }));
 
     const school = await School.findOne({ schoolId: req.schoolId }).lean();
     const timezone = school?.timezone || 'UTC';

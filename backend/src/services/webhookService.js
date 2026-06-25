@@ -8,6 +8,51 @@ const { validateWebhookUrl } = require('../utils/validateWebhookUrl');
 
 const WEBHOOK_TIMEOUT_MS = 10000; // 10 second timeout
 
+// ── Replay protection ────────────────────────────────────────────────────────
+// Delivered delivery IDs are stored (in-process or Redis) for REPLAY_WINDOW_S
+// seconds. Any webhook whose delivery ID is already in the store is rejected.
+const REPLAY_WINDOW_S = parseInt(process.env.WEBHOOK_REPLAY_WINDOW_S || '300', 10); // 5 min default
+
+/**
+ * In-process nonce store: Map<deliveryId, expiresAt (ms)>.
+ * Used when Redis is not configured. Entries are evicted lazily on each check.
+ */
+const _localNonces = new Map();
+
+function _evictExpiredNonces() {
+  const now = Date.now();
+  for (const [id, exp] of _localNonces) {
+    if (now > exp) _localNonces.delete(id);
+  }
+}
+
+/**
+ * Check if a delivery ID has been seen before (replay detection).
+ * Stores the ID if it is fresh.
+ *
+ * @param {string} deliveryId
+ * @returns {Promise<boolean>} true if this is a REPLAY (already seen), false if fresh
+ */
+async function _isReplay(deliveryId) {
+  const { getRedisClient, isRedisReady } = require('../config/redisClient');
+  if (isRedisReady()) {
+    const redis = getRedisClient();
+    const key = `webhook:nonce:${deliveryId}`;
+    // SET NX EX — only sets if the key does not exist; returns 'OK' or null
+    const result = await redis.set(key, '1', 'EX', REPLAY_WINDOW_S, 'NX');
+    return result === null; // null means key already existed → replay
+  }
+
+  // In-process fallback
+  _evictExpiredNonces();
+  if (_localNonces.has(deliveryId)) return true;
+  _localNonces.set(deliveryId, Date.now() + REPLAY_WINDOW_S * 1000);
+  return false;
+}
+
+/** Exposed for testing — clears the local nonce store. */
+function _resetNonces() { _localNonces.clear(); }
+
 /**
  * Generate HMAC-SHA256 signature for a webhook payload.
  *
@@ -74,6 +119,12 @@ async function fireWebhook(url, event, payload, secret = null, deliveryId = null
 
   const timestamp = Math.floor(Date.now() / 1000);
   const id = deliveryId || uuidv4();
+
+  // Replay protection: reject if this delivery ID has already been processed.
+  if (await _isReplay(id)) {
+    logger.warn('Webhook replay detected — delivery already processed', { deliveryId: id, event, url, correlationId });
+    return { success: false, error: 'Replay detected: delivery already processed', deliveryId: id };
+  }
 
   const body = {
     event,
@@ -442,4 +493,6 @@ module.exports = {
   processPendingRetries,
   retryWebhook,
   getBackoffDelay,
+  // Testing internals
+  _resetNonces,
 };

@@ -1,5 +1,25 @@
 'use strict';
 
+/**
+ * ROUNDING POLICY (Issue #751)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * All monetary arithmetic in this engine uses decimal.js (Decimal) to avoid
+ * IEEE-754 floating-point drift.
+ *
+ * Scale and rounding mode per asset:
+ *   XLM  — 7 decimal places, ROUND_HALF_UP (Stellar native precision)
+ *   USDC — 7 decimal places, ROUND_HALF_UP (stablecoin, same on-chain scale)
+ *   Fiat — 2 decimal places, ROUND_HALF_UP (standard currency display)
+ *
+ * Rule: NO raw JS Number arithmetic (+, -, *, /) on monetary values anywhere
+ * in the fee/payment path. Always construct `new Decimal(value)` and chain
+ * Decimal operations; convert back to Number only at the final output boundary
+ * via `.toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toNumber()`.
+ */
+
+const Decimal = require('decimal.js');
+Decimal.set({ precision: 20, rounding: Decimal.ROUND_HALF_UP });
+
 const logger = require('../utils/logger');
 
 /**
@@ -81,58 +101,70 @@ class DynamicFeeAdjustmentEngine {
   }
 
   /**
-   * Calculate final fee after applying all matching rules
+   * Calculate final fee after applying all matching rules.
+   * All arithmetic uses Decimal to prevent floating-point drift (Issue #751).
+   *
    * @param {Object} context - Fee calculation context
    * @returns {Object} Fee calculation result
    */
   calculateFee(context) {
-    let currentFee = Number(context.baseAmount || 0);
+    // Use Decimal throughout — no raw Number arithmetic on monetary values.
+    let currentFee = new Decimal(context.baseAmount || 0);
     const adjustments = [];
 
     for (const rule of this.rules) {
       if (rule.condition(context)) {
-        let adjustmentAmount = 0;
-
         const isFixed = rule.isFixed === true ||
           (typeof rule.description === 'string' && rule.description.toLowerCase().startsWith('fixed'));
+        const ruleValue = new Decimal(rule.value);
+        let adjustmentAmount;
+
         if (rule.type === 'discount') {
-          adjustmentAmount = isFixed ? -rule.value : -(currentFee * (rule.value / 100));
+          adjustmentAmount = isFixed
+            ? ruleValue.negated()
+            : currentFee.mul(ruleValue).div(100).negated();
         } else if (rule.type === 'penalty') {
-          adjustmentAmount = isFixed ? rule.value : currentFee * (rule.value / 100);
+          adjustmentAmount = isFixed
+            ? ruleValue
+            : currentFee.mul(ruleValue).div(100);
         } else {
-          adjustmentAmount = rule.value; // fixed amount
+          adjustmentAmount = ruleValue;
         }
 
-        currentFee += adjustmentAmount;
+        currentFee = currentFee.plus(adjustmentAmount);
 
         adjustments.push({
           ruleName: rule.name,
           type: rule.type,
           value: rule.value,
-          amountAdjusted: Math.abs(adjustmentAmount),
-          finalFeeAfterRule: parseFloat(currentFee.toFixed(2)),
+          amountAdjusted: adjustmentAmount.abs().toDecimalPlaces(2).toNumber(),
+          finalFeeAfterRule: currentFee.toDecimalPlaces(2).toNumber(),
           reason: rule.description,
         });
       }
     }
 
-    const finalFee = Math.max(0, currentFee); // Prevent negative fees
+    // Clamp to zero — no negative fees.
+    const finalFee = Decimal.max(new Decimal(0), currentFee);
 
-    if (currentFee < 0) {
+    if (currentFee.lt(0)) {
       logger.warn({
         msg: 'Fee clamped to 0 after adjustments',
         studentId: context.studentId || null,
-        unclampedAmount: parseFloat(currentFee.toFixed(2)),
+        unclampedAmount: currentFee.toDecimalPlaces(2).toNumber(),
       });
     }
 
+    const baseDecimal = new Decimal(context.baseAmount || 0);
+    const effectiveRate = baseDecimal.gt(0)
+      ? finalFee.div(baseDecimal).mul(100).toDecimalPlaces(2).toNumber()
+      : 100;
+
     return {
-      baseFee: context.baseAmount,
-      finalFee: parseFloat(finalFee.toFixed(2)),
+      baseFee: baseDecimal.toDecimalPlaces(2).toNumber(),
+      finalFee: finalFee.toDecimalPlaces(2).toNumber(),
       adjustments,
-      effectiveRate: context.baseAmount > 0 
-        ? parseFloat(((finalFee / context.baseAmount) * 100).toFixed(2)) 
-        : 100,
+      effectiveRate,
       totalAdjustments: adjustments.length,
     };
   }
