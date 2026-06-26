@@ -257,11 +257,13 @@ async function getStuckPayments(req, res, next) {
   }
 }
 
-// Allowed manual status transitions: from → [to, ...]
+// Admin-allowed manual status transitions: from → [to, ...]
+// Mirrors ADMIN_PAYMENT_STATUS_TRANSITIONS in paymentModel.js.
 const ALLOWED_TRANSITIONS = {
-  SUCCESS: ['DISPUTED'],
-  PENDING: ['FAILED'],
+  SUCCESS:   ['DISPUTED', 'REFUNDED'],
+  PENDING:   ['FAILED'],
   SUBMITTED: ['FAILED'],
+  DISPUTED:  ['REFUNDED'],
 };
 
 async function updatePaymentStatus(req, res, next) {
@@ -272,19 +274,24 @@ async function updatePaymentStatus(req, res, next) {
     if (!newStatus || !reason) return res.status(400).json({ error: 'status and reason are required', code: 'VALIDATION_ERROR' });
     if (newStatus === 'PENDING') return res.status(400).json({ error: 'Cannot transition to PENDING', code: 'INVALID_TRANSITION' });
 
-    const payment = await Payment.findOne({ schoolId: req.schoolId, txHash }).lean();
+    const payment = await Payment.findOne({ schoolId: req.schoolId, txHash });
     if (!payment) {
       const err = new Error('Payment not found');
       err.code = 'NOT_FOUND';
       return next(err);
     }
 
-    const allowed = ALLOWED_TRANSITIONS[payment.status] || [];
+    const previousStatus = payment.status;
+    const allowed = ALLOWED_TRANSITIONS[previousStatus] || [];
     if (!allowed.includes(newStatus)) {
-      return res.status(400).json({ error: `Cannot transition from ${payment.status} to ${newStatus}`, code: 'INVALID_TRANSITION' });
+      return res.status(400).json({ error: `Cannot transition from ${previousStatus} to ${newStatus}`, code: 'INVALID_TRANSITION' });
     }
 
-    const updated = await Payment.findOneAndUpdate({ schoolId: req.schoolId, txHash }, { $set: { status: newStatus } }, { new: true });
+    // Use the admin override path so the model's pre-save hook allows the
+    // expanded admin transition table. The audit trail is recorded below.
+    payment._adminOverride = true;
+    payment.status = newStatus;
+    const updated = await payment.save();
 
     await logAudit({
       schoolId: req.schoolId,
@@ -292,7 +299,7 @@ async function updatePaymentStatus(req, res, next) {
       performedBy: req.auditContext?.performedBy || 'unknown',
       targetId: txHash,
       targetType: 'payment',
-      details: { from: payment.status, to: newStatus, reason },
+      details: { from: previousStatus, to: newStatus, reason, adminOverride: true },
       result: 'success',
       ipAddress: req.auditContext?.ipAddress,
       userAgent: req.auditContext?.userAgent,

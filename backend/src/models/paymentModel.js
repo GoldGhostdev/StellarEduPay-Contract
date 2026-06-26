@@ -30,7 +30,7 @@ const paymentSchema = new mongoose.Schema(
     assetCode: { type: String, default: null },
     assetType: { type: String, default: null },
 
-    status: { type: String, enum: ['PENDING', 'SUBMITTED', 'SUCCESS', 'FAILED', 'DISPUTED', 'INVALID'], default: 'PENDING' },
+    status: { type: String, enum: ['PENDING', 'SUBMITTED', 'SUCCESS', 'FAILED', 'DISPUTED', 'REFUNDED', 'INVALID'], default: 'PENDING' },
     memo: { type: String },
     senderAddress: { type: String, default: null },
     isSuspicious: { type: Boolean, default: false },
@@ -132,6 +132,20 @@ const PAYMENT_STATUS_TRANSITIONS = {
   SUBMITTED: ['FAILED'],
 };
 
+/**
+ * Additional transitions available only when an admin sets adminOverride = true
+ * on the document before calling save(). These paths are audited by the caller.
+ *
+ * SUCCESS  → REFUNDED  : admin refunds a confirmed payment
+ * DISPUTED → REFUNDED  : admin resolves a dispute via refund
+ */
+const ADMIN_PAYMENT_STATUS_TRANSITIONS = {
+  SUCCESS:   ['DISPUTED', 'REFUNDED'],
+  PENDING:   ['FAILED'],
+  SUBMITTED: ['FAILED'],
+  DISPUTED:  ['REFUNDED'],
+};
+
 paymentSchema.pre('save', function (next) {
   // Use in-memory Mongoose helpers instead of a DB query to avoid an N+1
   // round-trip on every save. this.isNew is true for inserts; for existing
@@ -145,8 +159,13 @@ paymentSchema.pre('save', function (next) {
     const newStatus = this.status;
 
     if (originalStatus !== null && originalStatus !== newStatus) {
-      // Status is being changed — validate against the allowed transition table.
-      const allowed = PAYMENT_STATUS_TRANSITIONS[originalStatus] || [];
+      // When adminOverride is set the caller is responsible for auditing the
+      // action; the model enforces the wider admin-allowed transition table.
+      const transitionTable = this._adminOverride
+        ? ADMIN_PAYMENT_STATUS_TRANSITIONS
+        : PAYMENT_STATUS_TRANSITIONS;
+
+      const allowed = transitionTable[originalStatus] || [];
       if (!allowed.includes(newStatus)) {
         const err = new Error(
           `Payment status transition from ${originalStatus} to ${newStatus} is not allowed`,

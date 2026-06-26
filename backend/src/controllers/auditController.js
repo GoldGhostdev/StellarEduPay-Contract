@@ -8,16 +8,17 @@ const { getAuditLogs, getRecentAuditLogs } = require('../services/auditService')
  * Query parameters:
  *   - action: filter by action type
  *   - targetType: filter by target type (student, payment, fee, school)
- *   - performedBy: filter by admin user
+ *   - performedBy: filter by actor (admin user)
  *   - startDate: filter by date range (ISO 8601)
  *   - endDate: filter by date range (ISO 8601)
- *   - page: page number (default: 1)
+ *   - cursor: opaque pagination cursor from a prior response's nextCursor field
+ *   - page: page number for offset pagination (default: 1; ignored when cursor is set)
  *   - limit: results per page (default: 50, max: 200)
  */
 async function getAuditLogsEndpoint(req, res, next) {
   try {
     const { schoolId } = req;
-    const { action, targetType, performedBy, result, startDate, endDate, page, limit } = req.query;
+    const { action, targetType, performedBy, result, startDate, endDate, cursor, page, limit } = req.query;
 
     const auditResult = await getAuditLogs({
       schoolId,
@@ -27,6 +28,7 @@ async function getAuditLogsEndpoint(req, res, next) {
       result,
       startDate,
       endDate,
+      cursor: cursor || null,
       page: page ? parseInt(page, 10) : 1,
       limit: limit ? parseInt(limit, 10) : 50,
     });

@@ -7,6 +7,7 @@ const { concurrentPaymentProcessor } = require('../services/concurrentPaymentPro
 const { getReminderStatus } = require('../services/reminderService');
 const { getCachedRates } = require('../services/currencyConversionService');
 const { getAuditHealth } = require('../services/auditService');
+const { getRedisStatus } = require('../config/redisClient');
 const logger = require('../utils/logger');
 
 const STELLAR_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for Stellar health check
@@ -55,10 +56,6 @@ async function healthCheck(req, res) {
       ? stellarResult.value
       : { status: 'unreachable', error: stellarResult.reason?.message };
 
-  // Determine overall status:
-  // - healthy: DB is up AND Stellar is ok
-  // - degraded: DB is up BUT Stellar is unreachable
-  // - unhealthy: DB is down
   const retrySelector = require('../services/retryServiceSelector');
   const retryBackend = retrySelector.getSelectedBackend();
   const redisStatus = getRedisStatus();
@@ -79,11 +76,6 @@ async function healthCheck(req, res) {
   }
 
   const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
-
-  // Retry queue backend info
-  const retrySelector = require('../services/retryServiceSelector');
-  const retryBackend = retrySelector.getSelectedBackend();
-  const redisConfigured = Boolean(process.env.REDIS_HOST);
 
   // Retry queue init status. For the Redis-backed BullMQ pipeline this reflects
   // whether initializeRetryQueue() succeeded; for the MongoDB fallback it reflects
@@ -163,4 +155,58 @@ async function healthCheck(req, res) {
   return res.status(statusCode).json(body);
 }
 
-module.exports = { healthCheck };
+/**
+ * GET /health/live
+ * Liveness probe — returns 200 as long as the process is running.
+ * Orchestrators (e.g. Kubernetes) restart the pod when this fails.
+ */
+function livenessCheck(req, res) {
+  return res.status(200).json({ status: 'alive', timestamp: new Date().toISOString() });
+}
+
+/**
+ * GET /health/ready
+ * Readiness probe — returns 200 only when the service can handle traffic:
+ * the database must be reachable and Stellar Horizon must be responsive.
+ * Orchestrators stop routing traffic to the instance when this returns non-200.
+ */
+async function readinessCheck(req, res) {
+  const [dbResult, stellarResult] = await Promise.allSettled([
+    database.healthCheck(),
+    checkStellar(),
+  ]);
+
+  const db =
+    dbResult.status === 'fulfilled'
+      ? dbResult.value
+      : { healthy: false, reason: dbResult.reason?.message };
+
+  const stellar =
+    stellarResult.status === 'fulfilled'
+      ? stellarResult.value
+      : { status: 'unreachable', error: stellarResult.reason?.message };
+
+  const redisStatus = getRedisStatus();
+  const redisConfigured = Boolean(redisStatus.configured);
+
+  const ready =
+    db.healthy === true &&
+    stellar.status === 'ok' &&
+    (!redisConfigured || redisStatus.status === 'ready');
+
+  const statusCode = ready ? 200 : 503;
+
+  return res.status(statusCode).json({
+    ready,
+    timestamp: new Date().toISOString(),
+    checks: {
+      database: db.healthy ? 'ok' : 'fail',
+      stellar: stellar.status,
+      ...(stellar.activeUrl && { horizonEndpoint: stellar.activeUrl }),
+      ...(stellar.endpoints && { circuitState: stellar.endpoints }),
+      ...(redisConfigured && { redis: redisStatus.status }),
+    },
+  });
+}
+
+module.exports = { healthCheck, livenessCheck, readinessCheck };
