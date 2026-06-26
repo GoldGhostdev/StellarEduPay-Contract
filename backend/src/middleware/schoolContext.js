@@ -39,6 +39,17 @@ async function resolveSchool(req, res, next) {
       cacheKey = cache.KEYS.school ? cache.KEYS.school(schoolId) : `school:${schoolId}`;
       school = cache.get(cacheKey);
 
+      if (school) {
+        // Re-confirm isActive from DB on every cache hit to prevent stale entries
+        // from bypassing deactivation (e.g. when isActive is flipped outside the
+        // normal controller path or before the cache TTL expires).
+        const live = await School.findOne({ schoolId }, { isActive: 1 }).lean();
+        if (!live || !live.isActive) {
+          cache.del(cacheKey);
+          school = null;
+        }
+      }
+
       if (!school) {
         school = await School.findOne({ schoolId }).lean();
         if (school && school.isActive) {
@@ -49,6 +60,15 @@ async function resolveSchool(req, res, next) {
       const slug = schoolSlug.toLowerCase().trim();
       cacheKey = cache.KEYS.school ? cache.KEYS.school(slug) : `school:${slug}`;
       school = cache.get(cacheKey);
+
+      if (school) {
+        // Re-confirm isActive from DB on every cache hit.
+        const live = await School.findOne({ slug }, { isActive: 1 }).lean();
+        if (!live || !live.isActive) {
+          cache.del(cacheKey);
+          school = null;
+        }
+      }
 
       if (!school) {
         school = await School.findOne({ slug }).lean();

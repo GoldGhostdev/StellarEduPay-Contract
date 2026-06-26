@@ -72,10 +72,22 @@ class DynamicFeeAdjustmentEngine {
   }
 
   /**
-   * Add a new custom rule dynamically
+   * Add a new custom rule dynamically.
+   * Validates required fields and rejects percentage discounts > 100.
    * @param {Object} rule
    */
   addRule(rule) {
+    if (!rule || typeof rule !== 'object') throw new Error('rule must be an object');
+    if (!rule.id || typeof rule.id !== 'string') throw new Error('rule.id is required');
+    if (!rule.name || typeof rule.name !== 'string') throw new Error('rule.name is required');
+    if (!['discount', 'penalty'].includes(rule.type)) throw new Error('rule.type must be "discount" or "penalty"');
+    if (typeof rule.value !== 'number' || rule.value < 0) throw new Error('rule.value must be a non-negative number');
+    if (typeof rule.condition !== 'function') throw new Error('rule.condition must be a function');
+    const isFixed = rule.isFixed === true ||
+      (typeof rule.description === 'string' && rule.description.toLowerCase().startsWith('fixed'));
+    if (!isFixed && rule.type === 'discount' && rule.value > 100) {
+      throw new Error('discount percentage rule.value cannot exceed 100');
+    }
     this.rules.push(rule);
     this.rules.sort((a, b) => b.priority - a.priority);
   }

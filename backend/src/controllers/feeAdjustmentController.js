@@ -9,6 +9,7 @@ function validateBody(body) {
   if (!name || typeof name !== 'string' || !name.trim()) return 'name is required';
   if (!VALID_TYPES.includes(type)) return `type must be one of: ${VALID_TYPES.join(', ')}`;
   if (value == null || typeof value !== 'number' || value < 0) return 'value must be a non-negative number';
+  if (type === 'discount_percentage' && value > 100) return 'discount_percentage value cannot exceed 100';
   return null;
 }
 
