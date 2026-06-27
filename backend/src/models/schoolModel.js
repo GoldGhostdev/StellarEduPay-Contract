@@ -57,7 +57,18 @@ const schoolSchema = new mongoose.Schema(
      * Used for date grouping in reports and dashboard metrics.
      * Defaults to UTC.
      */
-    timezone:       { type: String, default: 'UTC', trim: true },
+    timezone: {
+      type: String,
+      default: 'UTC',
+      trim: true,
+      validate: {
+        validator(tz) {
+          if (!tz) return true;
+          try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; }
+        },
+        message: props => `'${props.value}' is not a valid IANA timezone identifier`,
+      },
+    },
     /**
      * Per-school webhook endpoint URL. Must be an https:// URL that resolves
      * to a public IP address (RFC 1918, loopback, and link-local are rejected).

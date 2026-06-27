@@ -230,19 +230,19 @@ function reportToCsv(report) {
  * @param {{ schoolId: string, timezone?: string }} options
  */
 async function getDashboardMetrics({ schoolId, timezone = 'UTC' } = {}) {
-  // Calculate start of today in the school's timezone
   const now = new Date();
-  const formatter = new Intl.DateTimeFormat('en-CA', {
+
+  // Compute start of today in the school's timezone as the correct UTC epoch.
+  // Strategy: subtract how many ms have elapsed in the current day (measured in
+  // the school's timezone) from now. This handles any UTC offset including DST.
+  const timeParts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-  const parts = formatter.formatToParts(now);
-  const dateMap = {};
-  parts.forEach(p => { dateMap[p.type] = p.value; });
-  const todayStr = `${dateMap.year}-${dateMap.month}-${dateMap.day}`;
-  const startOfToday = new Date(todayStr + 'T00:00:00.000Z');
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(now);
+  const tp = {};
+  timeParts.forEach(p => { tp[p.type] = parseInt(p.value, 10) || 0; });
+  const msIntoDay = tp.hour * 3600000 + tp.minute * 60000 + tp.second * 1000;
+  const startOfToday = new Date(now.getTime() - msIntoDay - (now.getTime() % 1000));
 
   const [
     totalStudents,

@@ -31,7 +31,6 @@ async function syncAllPayments(req, res, next) {
   const stopSyncTimer = syncDurationSeconds.startTimer();
   try {
     const summary = await syncPaymentsForSchool(req.school);
-    stopSyncTimer();
 
     if (req.auditContext) {
       await logAudit({
@@ -74,9 +73,9 @@ async function syncAllPayments(req, res, next) {
         userAgent: req.auditContext.userAgent,
       });
     }
-    stopSyncTimer();
     next(wrapStellarError(err));
   } finally {
+    stopSyncTimer();
     _syncLocks.delete(schoolId);
   }
 }
