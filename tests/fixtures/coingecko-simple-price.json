@@ -1,0 +1,17 @@
+{
+  "_comment": "Recorded fixture for CoinGecko GET /api/v3/simple/price?ids=stellar,usd-coin&vs_currencies=usd",
+  "_contract": {
+    "endpoint": "https://api.coingecko.com/api/v3/simple/price",
+    "params": { "ids": "stellar,usd-coin", "vs_currencies": "usd" },
+    "required_keys": ["stellar", "usd-coin"],
+    "stellar_required": ["usd"],
+    "usd_coin_required": ["usd"],
+    "value_type": "positive finite number"
+  },
+  "stellar": {
+    "usd": 0.24
+  },
+  "usd-coin": {
+    "usd": 1.0
+  }
+}

@@ -15,12 +15,60 @@
  *     price_feed_staleness_seconds{provider}.
  *   - Stale-while-revalidate: serve stale cache when both providers fail,
  *     up to PRICE_STALE_THRESHOLD_MS (default 1 hour).
+ *
+ * Fix #892: decimal-safe multiplication via decimal.js; per-currency decimal
+ *   precision honours ISO 4217 (e.g. JPY = 0 dp, KWD = 3 dp, USD = 2 dp).
  */
 
-const https = require("https");
+const https   = require("https");
+const Decimal = require("decimal.js");
 const client = require("prom-client");
 const { getRedisClient, isRedisReady } = require("../config/redisClient");
 const logger = require("../utils/logger").child("CurrencyConversion");
+
+// ── Per-currency decimal precision (ISO 4217) ─────────────────────────────────
+//
+// Most currencies use 2 decimal places.  Exceptions are listed here so that
+// amounts in zero-decimal currencies (JPY, KRW …) are never shown as "¥1.23"
+// and amounts in 3-decimal currencies (KWD, BHD …) are not under-rounded.
+//
+// Source: ISO 4217 minor unit definitions.
+//
+// CoinGecko response contract (documented here for #893):
+//   GET /api/v3/simple/price?ids=stellar,usd-coin&vs_currencies=<CURRENCY>
+//   {
+//     "stellar":   { "<lc_currency>": <number> },   // XLM rate
+//     "usd-coin":  { "<lc_currency>": <number> }    // USDC rate
+//   }
+//   Both keys MUST be present and their values MUST be positive finite numbers.
+const CURRENCY_DECIMALS = {
+  // 0 decimal places
+  BIF: 0, CLP: 0, DJF: 0, GNF: 0, ISK: 0, JPY: 0, KMF: 0, KRW: 0,
+  MGA: 0, PYG: 0, RWF: 0, UGX: 0, VND: 0, VUV: 0, XAF: 0, XOF: 0, XPF: 0,
+  // 3 decimal places
+  BHD: 3, IQD: 3, JOD: 3, KWD: 3, LYD: 3, OMR: 3, TND: 3,
+  // default is 2 — not listed here
+};
+
+/**
+ * Multiply `amount` by `rate` using decimal-safe arithmetic and round to the
+ * correct number of decimal places for `currency`.
+ *
+ * Returns a plain JS number suitable for JSON serialisation. Uses
+ * ROUND_HALF_UP to match the expectation of most financial displays.
+ *
+ * @param {number|string} amount
+ * @param {number|string} rate
+ * @param {string}        currency  - ISO 4217 code (e.g. "USD", "JPY")
+ * @returns {number}
+ */
+function _decimalMultiply(amount, rate, currency) {
+  const dp = CURRENCY_DECIMALS[currency.toUpperCase()] ?? 2;
+  return new Decimal(amount)
+    .times(new Decimal(rate))
+    .toDecimalPlaces(dp, Decimal.ROUND_HALF_UP)
+    .toNumber();
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -255,7 +303,7 @@ async function convertToLocalCurrency(amount, assetCode = "XLM", targetCurrency 
   }
 
   return {
-    localAmount:   parseFloat((amount * rate).toFixed(2)),
+    localAmount:   _decimalMultiply(amount, rate, currency),
     currency,
     rate,
     rateTimestamp: new Date(rateEntry.fetchedAt).toISOString(),
@@ -291,7 +339,8 @@ async function formatWithLocalEquivalent(amount, assetCode = "XLM", targetCurren
   const base = `${parseFloat(amount).toFixed(7)} ${assetCode}`;
   const conv = await convertToLocalCurrency(amount, assetCode, targetCurrency);
   if (!conv.available || conv.localAmount === null) return `${base} (rate unavailable)`;
-  return `${base} (≈ ${conv.localAmount.toFixed(2)} ${conv.currency})`;
+  const dp = CURRENCY_DECIMALS[conv.currency.toUpperCase()] ?? 2;
+  return `${base} (≈ ${conv.localAmount.toFixed(dp)} ${conv.currency})`;
 }
 
 function getCachedRates() {
@@ -338,6 +387,80 @@ async function captureFiatSnapshot(amount, assetCode = "XLM", currency = "USD") 
   }
 }
 
+// ── CoinGecko response contract canary (#893) ─────────────────────────────────
+//
+// Validates that a CoinGecko /simple/price response for the given currency
+// still conforms to the expected shape.  Returns { ok: true } when valid or
+// { ok: false, reason: string } when the shape has changed.
+//
+// Intended use:
+//   1. In periodic health checks / cron jobs to detect silent API drift.
+//   2. In contract tests against a recorded fixture to prevent regressions.
+//
+// Expected shape (documented contract):
+//   data.stellar[lc_currency]     — positive finite number  (XLM rate)
+//   data['usd-coin'][lc_currency] — positive finite number  (USDC rate)
+function checkCoinGeckoResponseShape(data, currency) {
+  const lc = (currency || "").toLowerCase();
+
+  if (!data || typeof data !== "object") {
+    return { ok: false, reason: "response is not an object" };
+  }
+  if (!data.stellar || typeof data.stellar !== "object") {
+    return { ok: false, reason: 'missing top-level key "stellar"' };
+  }
+  if (!data["usd-coin"] || typeof data["usd-coin"] !== "object") {
+    return { ok: false, reason: 'missing top-level key "usd-coin"' };
+  }
+
+  const xlmRate  = data.stellar[lc];
+  const usdcRate = data["usd-coin"][lc];
+
+  if (typeof xlmRate !== "number" || !isFinite(xlmRate) || xlmRate <= 0) {
+    return { ok: false, reason: `stellar.${lc} is not a positive finite number (got ${JSON.stringify(xlmRate)})` };
+  }
+  if (typeof usdcRate !== "number" || !isFinite(usdcRate) || usdcRate <= 0) {
+    return { ok: false, reason: `usd-coin.${lc} is not a positive finite number (got ${JSON.stringify(usdcRate)})` };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Periodic canary: fetches a live CoinGecko rate for `currency` (default
+ * "usd") and validates the response shape.  Logs a warning when the shape
+ * has drifted so operators are alerted before conversions silently fail.
+ *
+ * Never throws — designed to be called from a health check or cron without
+ * disrupting the main application flow.
+ *
+ * @param {string} [currency="usd"]
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
+async function runCoinGeckoCanary(currency = "usd") {
+  try {
+    let url =
+      "https://api.coingecko.com/api/v3/simple/price" +
+      `?ids=stellar%2Cusd-coin&vs_currencies=${encodeURIComponent(currency)}`;
+    if (COINGECKO_API_KEY) url += `&x_cg_pro_api_key=${encodeURIComponent(COINGECKO_API_KEY)}`;
+
+    const data   = await httpsGet(url);
+    const result = checkCoinGeckoResponseShape(data, currency);
+
+    if (!result.ok) {
+      _recordAvailable("coingecko", false);
+      logger.warn("CoinGecko canary: response shape mismatch", { currency, reason: result.reason });
+    } else {
+      logger.info("CoinGecko canary: response shape OK", { currency });
+    }
+
+    return result;
+  } catch (err) {
+    logger.warn("CoinGecko canary: fetch failed", { currency, error: err.message });
+    return { ok: false, reason: err.message };
+  }
+}
+
 module.exports = {
   convertToLocalCurrency,
   enrichPaymentWithConversion,
@@ -349,6 +472,10 @@ module.exports = {
   convertXlmToLocal,
   formatWithConversion,
   attachConversion,
+  // #893 — CoinGecko contract validation
+  checkCoinGeckoResponseShape,
+  runCoinGeckoCanary,
+  CURRENCY_DECIMALS,
   // Testing internals
   _fetchRatesFromCoinGecko: (c) => _fetchFromCoinGecko(c),
   _getRates: getRates,

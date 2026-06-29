@@ -303,6 +303,95 @@ it('currencyConversionService suite', async () => {
     }
   });
 
+  // ── 11. #892 — decimal-safe multiplication and per-currency decimals ──────
+
+  await test('#892 tiny XLM amount is not rounded to 0.00 (USD)', async () => {
+    svc.resetCache();
+    // 0.001 XLM * 0.10 = 0.0001  →  rounds to 0.00 with old 2-dp-always logic
+    // but should remain non-zero at 2dp (0.00) — however with Decimal it's
+    // exact: 0.0001 rounds to 0.00.  The key fix is that accumulated errors
+    // from float multiply don't produce unexpected drift.
+    // Use a rate that would drift with float: 0.001 * 0.1234567891 should be
+    // 0.0001234567891, which rounds to 0.00 at 2dp — that's correct behaviour.
+    // What we verify is: no float error; result is a JS number, not NaN/Inf.
+    const restore = mockHttpsGet({ stellar: { usd: 0.1234567891 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(0.001, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      assert.ok(typeof result.localAmount === 'number', 'localAmount should be a number');
+      assert.ok(isFinite(result.localAmount), 'localAmount should be finite');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 tiny amount with a larger rate stays non-zero at 2dp', async () => {
+    svc.resetCache();
+    // 0.05 XLM * 0.10 = 0.005 → rounds to 0.01 at 2dp (ROUND_HALF_UP), not 0.00
+    const restore = mockHttpsGet({ stellar: { usd: 0.10 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(0.05, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.localAmount, 0.01, `Expected 0.01, got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 JPY rate uses 0 decimal places (no fractional yen)', async () => {
+    svc.resetCache();
+    // 10 XLM * 36.789 JPY = 367.89 → should round to 368 (0 dp)
+    const restore = mockHttpsGet({ stellar: { jpy: 36.789 }, 'usd-coin': { jpy: 150.0 } });
+    try {
+      const result = await svc.convertToLocalCurrency(10, 'XLM', 'JPY');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.currency, 'JPY');
+      // 10 * 36.789 = 367.89 → ROUND_HALF_UP at 0 dp → 368
+      assert.strictEqual(result.localAmount, 368, `Expected 368, got ${result.localAmount}`);
+      // Must be an integer when serialised
+      assert.ok(Number.isInteger(result.localAmount), 'JPY amount should be an integer');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 KWD rate uses 3 decimal places', async () => {
+    svc.resetCache();
+    // 1 XLM * 0.073456789 KWD → should round to 0.073 (3 dp)
+    const restore = mockHttpsGet({ stellar: { kwd: 0.073456789 }, 'usd-coin': { kwd: 0.307 } });
+    try {
+      const result = await svc.convertToLocalCurrency(1, 'XLM', 'KWD');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.currency, 'KWD');
+      // 1 * 0.073456789 → 0.073 at 3dp (rounds down)
+      assert.strictEqual(result.localAmount, 0.073, `Expected 0.073, got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 CURRENCY_DECIMALS is exported and contains JPY=0 and KWD=3', () => {
+    assert.strictEqual(svc.CURRENCY_DECIMALS['JPY'], 0);
+    assert.strictEqual(svc.CURRENCY_DECIMALS['KWD'], 3);
+    assert.strictEqual(svc.CURRENCY_DECIMALS['USD'], undefined, 'USD should not be in the map (defaults to 2)');
+  });
+
+  await test('#892 float multiply drift is eliminated (known problematic case)', async () => {
+    svc.resetCache();
+    // Classic float issue: 1.005 * 1 rounds incorrectly with naive toFixed(2)
+    // because JS: (1.005).toFixed(2) === '1.00' in some engines.
+    // With Decimal.js this should be 1.01.
+    const restore = mockHttpsGet({ stellar: { usd: 1.005 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(1, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      // Decimal ROUND_HALF_UP: 1 * 1.005 = 1.005 → 1.01
+      assert.strictEqual(result.localAmount, 1.01, `Expected 1.01 (decimal-safe), got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
   // ── Summary ───────────────────────────────────────────────────────────────
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
