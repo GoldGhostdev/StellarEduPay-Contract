@@ -286,9 +286,10 @@ async function updatePaymentStatus(req, res, next) {
       return res.status(400).json({ error: `Cannot transition from ${previousStatus} to ${newStatus}`, code: 'INVALID_TRANSITION' });
     }
 
-    // Use the admin override path so the model's pre-save hook allows the
-    // expanded admin transition table. The audit trail is recorded below.
-    payment._adminOverride = true;
+    // Set $locals.adminOverride so the pre-save hook uses ADMIN_PAYMENT_STATUS_TRANSITIONS
+    // instead of the narrower PAYMENT_STATUS_TRANSITIONS.  $locals is Mongoose's
+    // per-document transient store — it is never persisted and survives through save().
+    payment.$locals.adminOverride = true;
     payment.status = newStatus;
     const updated = await payment.save();
 

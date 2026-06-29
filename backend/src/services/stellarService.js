@@ -326,7 +326,7 @@ async function detectAbnormalPatterns(
  *   UNSUPPORTED_ASSET (400)   — asset not accepted
  *   AMOUNT_TOO_LOW/HIGH (400) — outside configured limits
  */
-async function verifyTransaction(txHash, walletAddress) {
+async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const tx = await withStellarRetry(
     () => server.transactions().transaction(txHash).call(),
     { label: "verifyTransaction" },
@@ -410,9 +410,10 @@ async function verifyTransaction(txHash, walletAddress) {
     throw err;
   }
 
-  // 6. Look up student to validate fee (student lookup is not school-scoped here
-  //    since memo = studentId; recordPayment caller passes schoolId explicitly)
-  const student = await Student.findOne({ studentId: memo });
+  // 6. Look up student to validate fee. School-scope when schoolId is provided so
+  //    the same studentId string used across two schools resolves to the correct one.
+  const studentQuery = schoolId ? { schoolId, studentId: memo } : { studentId: memo };
+  const student = await Student.findOne(studentQuery);
   const feeAmount = student ? student.feeAmount : null;
 
   const feeValidation =
@@ -490,10 +491,6 @@ async function syncPaymentsForSchool(school) {
       if (existing) { summary.alreadyProcessed++; done = true; break; }
 
       summary.new++;
-      if (existing) {
-        done = true;
-        break;
-      }
 
       const valid = await extractValidPayment(tx, stellarAddress);
       if (!valid) {
@@ -533,10 +530,17 @@ async function syncPaymentsForSchool(school) {
         continue;
       }
 
+      // Decouple crediting from intent existence (#848): a pending intent is the
+      // preferred path, but if none exists (expired or never created) we fall back
+      // to matching by memo (= studentId) directly. This ensures a late-but-valid
+      // on-chain payment is always credited even after the intent TTL'd away.
       const intent = await PaymentIntent.findOne({ schoolId, memo, status: 'pending' });
-      if (!intent) { summary.unmatched++; continue; }
-
-      const student = await Student.findOne({ schoolId, studentId: intent.studentId });
+      let student;
+      if (intent) {
+        student = await Student.findOne({ schoolId, studentId: intent.studentId });
+      } else {
+        student = await Student.findOne({ schoolId, studentId: memo });
+      }
       if (!student) { summary.unmatched++; continue; }
 
       summary.matched++;
@@ -579,8 +583,14 @@ async function syncPaymentsForSchool(school) {
       const isConfirmed = isConfirmedOrAbove(confirmation.state);
       const confirmationStatus = confirmation.confirmationStatus;
 
+      const studentId = student.studentId;
+      // Fee amount and category come from the intent when one exists; otherwise
+      // fall back to the student's current fee record (intent-decoupled crediting).
+      const feeAmountForRecord = intent ? intent.amount : student.feeAmount;
+      const feeCategory = intent ? (intent.feeCategory || null) : null;
+
       const previousPayments = await Payment.aggregate([
-        { $match: { schoolId, studentId: intent.studentId, deletedAt: null } },
+        { $match: { schoolId, studentId, deletedAt: null } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]);
       const previousTotal = previousPayments.length
@@ -590,10 +600,11 @@ async function syncPaymentsForSchool(school) {
         (previousTotal + paymentAmount).toFixed(7),
       );
 
+      // Partial payments are accepted in the sync path — cumulative total determines status.
+      // A single payment below the fee is recorded as 'partial' (credit toward remainingBalance).
       let cumulativeStatus;
       if (cumulativeTotal < student.feeAmount) cumulativeStatus = "partial";
-      else if (cumulativeTotal > student.feeAmount)
-        cumulativeStatus = "overpaid";
+      else if (cumulativeTotal > student.feeAmount) cumulativeStatus = "overpaid";
       else cumulativeStatus = "valid";
 
       const excessAmount =
@@ -601,64 +612,71 @@ async function syncPaymentsForSchool(school) {
           ? parseFloat((cumulativeTotal - student.feeAmount).toFixed(7))
           : 0;
 
-      // In the sync path, partial payments are accepted — the cumulative status
-      // (partial / valid / overpaid) is what gets recorded. Per-transaction
-      // underpaid rejection is intentionally skipped here; the verifyPayment
-      // endpoint still rejects underpaid single-payment verifications.
-
-      await savePayment({
-        schoolId,
-        studentId: intent.studentId,
-        txHash: tx.hash,
-        correlationId: deriveCorrelationId(tx.hash),
-        amount: paymentAmount,
-        feeAmount: intent.amount,
-        feeCategory: intent.feeCategory || null,
-        feeValidationStatus: cumulativeStatus,
-        excessAmount,
-        status: "SUCCESS",
-        memo,
-        senderAddress,
-        isSuspicious,
-        suspicionReason,
-        ledger: txLedger,
-        ledgerSequence: txLedger,
-        confirmationStatus,
-        confirmationState: confirmation.state,
-        confirmedAt: txDate,
-      });
+      try {
+        await savePayment({
+          schoolId,
+          studentId,
+          txHash: tx.hash,
+          correlationId: deriveCorrelationId(tx.hash),
+          amount: paymentAmount,
+          feeAmount: feeAmountForRecord,
+          feeCategory,
+          feeValidationStatus: cumulativeStatus,
+          excessAmount,
+          status: "SUCCESS",
+          memo,
+          senderAddress,
+          isSuspicious,
+          suspicionReason,
+          ledger: txLedger,
+          ledgerSequence: txLedger,
+          confirmationStatus,
+          confirmationState: confirmation.state,
+          confirmedAt: txDate,
+        });
+      } catch (saveErr) {
+        if (saveErr.code === 'DUPLICATE_TX') {
+          // Another concurrent path (poller or verify) already recorded this tx.
+          // Treat as already-processed rather than an error.
+          summary.new--;
+          summary.alreadyProcessed++;
+          if (intent) {
+            await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'completed' });
+          }
+          continue;
+        }
+        throw saveErr;
+      }
       newPayments++;
 
       logger.info("Transaction recorded", {
         txHash: tx.hash,
         schoolId,
-        studentId: intent.studentId,
+        studentId,
         amount: paymentAmount,
         feeValidationStatus: cumulativeStatus,
         isSuspicious,
         confirmationStatus,
         confirmationState: confirmation.state,
+        intentMatched: Boolean(intent),
       });
 
       if (isConfirmed && !isSuspicious) {
-        // Update student record
         const updateData = {
           totalPaid: cumulativeTotal,
           remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
           feePaid: cumulativeTotal >= student.feeAmount,
         };
 
-        // If this payment is for a specific fee category, update that category's paid status
-        if (intent.feeCategory && student.fees && student.fees.length > 0) {
-          const feeIndex = student.fees.findIndex(f => f.category === intent.feeCategory);
+        if (feeCategory && student.fees && student.fees.length > 0) {
+          const feeIndex = student.fees.findIndex(f => f.category === feeCategory);
           if (feeIndex !== -1) {
-            // Calculate new total paid for this category
             const categoryPayments = await Payment.aggregate([
               {
                 $match: {
                   schoolId,
-                  studentId: intent.studentId,
-                  feeCategory: intent.feeCategory,
+                  studentId,
+                  feeCategory,
                   confirmationStatus: "confirmed",
                   isSuspicious: false,
                   deletedAt: null,
@@ -670,27 +688,22 @@ async function syncPaymentsForSchool(school) {
               ? parseFloat(categoryPayments[0].total.toFixed(7))
               : 0;
 
-            // Update the specific fee category
             student.fees[feeIndex].totalPaid = categoryTotalPaid;
             student.fees[feeIndex].remainingBalance = Math.max(
               0,
               student.fees[feeIndex].amount - categoryTotalPaid
             );
             student.fees[feeIndex].paid = categoryTotalPaid >= student.fees[feeIndex].amount;
-
             updateData.fees = student.fees;
           }
         }
 
-        await Student.findOneAndUpdate(
-          { schoolId, studentId: intent.studentId },
-          updateData,
-        );
+        await Student.findOneAndUpdate({ schoolId, studentId }, updateData);
       }
 
-      await PaymentIntent.findByIdAndUpdate(intent._id, {
-        status: "completed",
-      });
+      if (intent) {
+        await PaymentIntent.findByIdAndUpdate(intent._id, { status: "completed" });
+      }
     }
 
     if (!done) {
