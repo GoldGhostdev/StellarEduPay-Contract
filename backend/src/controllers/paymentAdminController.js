@@ -311,6 +311,78 @@ async function updatePaymentStatus(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/payments/:txHash/suspicion-review
+ *
+ * Review a flagged (suspicious) payment. Resolves the false-positive / fraud
+ * ambiguity an admin would otherwise have no way to act on:
+ *
+ *   action: 'clear'         — false positive. Removes the suspicious flag so the
+ *                             payment leaves the suspicious queue.
+ *   action: 'confirm_fraud' — confirmed fraudulent. Keeps it flagged/excluded
+ *                             and records the determination.
+ *
+ * The balance-affecting status (SUCCESS/FAILED/etc.) is intentionally left to
+ * the existing updatePaymentStatus flow so this endpoint never silently mutates
+ * student balances. Every review is written to the audit log.
+ */
+async function reviewSuspiciousPayment(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { txHash } = req.params;
+    const { action, note } = req.body;
+
+    if (!['clear', 'confirm_fraud'].includes(action)) {
+      return res.status(400).json({
+        error: "action must be 'clear' or 'confirm_fraud'",
+        code: 'VALIDATION_ERROR',
+      });
+    }
+
+    const payment = await Payment.findOne({ schoolId, txHash });
+    if (!payment) {
+      return res.status(404).json({ error: 'Payment not found', code: 'NOT_FOUND' });
+    }
+    if (!payment.isSuspicious && payment.suspicionReviewStatus === 'flagged') {
+      return res.status(400).json({ error: 'Payment is not flagged as suspicious', code: 'NOT_FLAGGED' });
+    }
+
+    const previousStatus = payment.suspicionReviewStatus;
+    const reviewer = req.auditContext?.performedBy || 'unknown';
+
+    payment.suspicionReviewStatus = action === 'clear' ? 'cleared' : 'confirmed_fraud';
+    payment.suspicionReviewedBy = reviewer;
+    payment.suspicionReviewedAt = new Date();
+    payment.suspicionReviewNote = note || null;
+    // Clearing a false positive removes it from the suspicious queue; confirming
+    // fraud keeps the flag.
+    if (action === 'clear') payment.isSuspicious = false;
+
+    const updated = await payment.save();
+
+    await logAudit({
+      schoolId,
+      action: 'payment_suspicion_review',
+      performedBy: reviewer,
+      targetId: txHash,
+      targetType: 'payment',
+      details: {
+        from: previousStatus,
+        to: payment.suspicionReviewStatus,
+        suspicionReason: payment.suspicionReason,
+        note: note || null,
+      },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+}
+
 function streamPaymentEvents(req, res) {
   const { addClient, removeClient } = require('../services/sseService');
   const { schoolId } = req;
@@ -345,6 +417,7 @@ module.exports = {
   getQueueJobStatus,
   getStuckPayments,
   updatePaymentStatus,
+  reviewSuspiciousPayment,
   streamPaymentEvents,
   _syncLocks,
 };

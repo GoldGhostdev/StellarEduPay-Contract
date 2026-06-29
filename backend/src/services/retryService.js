@@ -73,6 +73,76 @@ async function queueForRetry(
   });
 }
 
+/**
+ * Operator visibility / re-drive helpers for the dead-letter backlog.
+ * These intentionally span all schools (bypassTenantScope) because they back
+ * global super-admin endpoints. Callers must enforce admin auth.
+ */
+
+/** Count pending-verification documents grouped by status (for metrics/alerting). */
+async function getBacklogCounts() {
+  const rows = await PendingVerification.aggregate([
+    { $group: { _id: "$status", count: { $sum: 1 } } },
+  ]);
+  const counts = { pending: 0, processing: 0, resolved: 0, dead_letter: 0 };
+  for (const { _id, count } of rows) {
+    if (_id) counts[_id] = count;
+  }
+  return counts;
+}
+
+/**
+ * List dead-lettered verifications, newest first.
+ * @param {{ limit?: number, skip?: number, schoolId?: string }} opts
+ */
+async function listDeadLetters({ limit = 50, skip = 0, schoolId = null } = {}) {
+  const query = { status: "dead_letter" };
+  if (schoolId) query.schoolId = schoolId;
+
+  const cappedLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+  const cappedSkip = Math.max(parseInt(skip, 10) || 0, 0);
+
+  const [items, total] = await Promise.all([
+    PendingVerification.find(query)
+      .bypassTenantScope()
+      .sort({ updatedAt: -1 })
+      .skip(cappedSkip)
+      .limit(cappedLimit)
+      .lean(),
+    PendingVerification.countDocuments(query).bypassTenantScope(),
+  ]);
+
+  return { items, total, limit: cappedLimit, skip: cappedSkip };
+}
+
+/** Inspect a single dead-lettered (or any) verification by its document id. */
+async function getPendingVerification(id) {
+  return PendingVerification.findById(id).bypassTenantScope().lean();
+}
+
+/**
+ * Re-drive a dead-lettered verification: reset it to `pending`, clear the
+ * attempt counter, and make it due immediately so the retry worker picks it up
+ * on its next tick. Returns the updated document, or null if not found / not in
+ * the dead_letter state.
+ *
+ * @param {string} id PendingVerification document id
+ */
+async function redriveDeadLetter(id) {
+  return PendingVerification.findOneAndUpdate(
+    { _id: id, status: "dead_letter" },
+    {
+      $set: {
+        status: "pending",
+        attempts: 0,
+        nextRetryAt: new Date(),
+        lastError: null,
+      },
+    },
+    { new: true },
+  ).bypassTenantScope();
+}
+
 let _running = false;
 let _timer = null;
 
@@ -270,4 +340,8 @@ module.exports = {
   startRetryWorker,
   stopRetryWorker,
   isRetryWorkerRunning,
+  getBacklogCounts,
+  listDeadLetters,
+  getPendingVerification,
+  redriveDeadLetter,
 };

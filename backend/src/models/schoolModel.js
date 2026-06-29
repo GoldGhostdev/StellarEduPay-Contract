@@ -96,6 +96,26 @@ const schoolSchema = new mongoose.Schema(
       max: [100, 'suspiciousPaymentMultiplier must not exceed 100'],
     },
     /**
+     * Per-tenant configuration for the suspicious-amount heuristic. A flat
+     * multiplier off the expected fee mis-fires for schools whose normal
+     * payments cluster differently; enabling the historical mode bases the
+     * threshold on the school's OWN confirmed-payment distribution instead.
+     *
+     *   mode               — 'fee_multiplier' (default; uses suspiciousPaymentMultiplier)
+     *                        or 'historical' (z-score against the school's history).
+     *   historicalWindowDays    — lookback window for building the distribution.
+     *   historicalStdDevMultiplier — flag amounts more than N std-devs from the mean.
+     *   historicalMinSamples    — minimum confirmed payments before the historical
+     *                             threshold engages (below this it falls back to
+     *                             the fee multiplier, avoiding cold-start noise).
+     */
+    suspiciousAmountConfig: {
+      mode: { type: String, enum: ['fee_multiplier', 'historical'], default: 'fee_multiplier' },
+      historicalWindowDays: { type: Number, default: 90, min: 1, max: 730 },
+      historicalStdDevMultiplier: { type: Number, default: 3.0, min: 1.0, max: 10 },
+      historicalMinSamples: { type: Number, default: 20, min: 1, max: 100000 },
+    },
+    /**
      * Maximum payment multiplier for this school.
      * The maximum allowed payment is feeAmount * maxPaymentMultiplier.
      * Allows each school to define what constitutes a suspicious overpayment.

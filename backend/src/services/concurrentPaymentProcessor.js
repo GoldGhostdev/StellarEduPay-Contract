@@ -174,6 +174,29 @@ class ConcurrentPaymentProcessor {
     this.maxRetries = options.maxRetries || 3;
     this.maxQueueDepth = options.maxQueueDepth || 1000;
     this.activeCount = 0;
+
+    // ── Batch / backpressure tuning (issue #851) ──────────────────────────────
+    // Default concurrency for processBatch when the caller doesn't override it.
+    this.batchConcurrencyLimit = options.batchConcurrencyLimit || 10;
+    // When Horizon (via the rate-limited client) signals saturation, hold new
+    // dispatches rather than piling on and tripping the rate limiter. Bounded so
+    // a wedged signal can't stall a batch forever. Off by default so unit tests
+    // that construct a bare processor don't pull in the Horizon client; the
+    // production singleton below opts in.
+    this.backpressureEnabled = options.backpressureEnabled === true;
+    this.backpressureDelayMs = options.backpressureDelayMs || 100;
+    this.maxBackpressureWaitMs = options.maxBackpressureWaitMs || 5000;
+    // Injectable for tests; defaults to the shared rate-limited client's readiness.
+    this.isHorizonReady =
+      options.isHorizonReady ||
+      (() => {
+        try {
+          return require("./stellarRateLimitedClient").getClient().isReady();
+        } catch (_) {
+          // Client not initialized (e.g. Redis-less test env) — assume ready.
+          return true;
+        }
+      });
   }
 
   // ── Process Payment ───────────────────────────────────────────────────────
@@ -574,41 +597,139 @@ class ConcurrentPaymentProcessor {
     );
   }
 
-  // ── Batch Processing ─────────────────────────────────────────────────────
-  async processBatch(payments, options = {}) {
-    const results = [];
-    const concurrencyLimit = options.concurrencyLimit || 10;
-    const queueFullRetryDelayMs = options.queueFullRetryDelayMs !== undefined ? options.queueFullRetryDelayMs : 500;
-
-    for (let i = 0; i < payments.length; i += concurrencyLimit) {
-      const batch = payments.slice(i, i + concurrencyLimit);
-      const batchResults = await Promise.allSettled(
-        batch.map(async (p) => {
-          let result = await this.processPayment(p, options);
-          while (result && result.error && result.error.code === "QUEUE_FULL") {
-            logger.warn("[PaymentProcessor] Queue full, retrying after delay", {
-              retryDelayMs: queueFullRetryDelayMs,
-            });
-            await new Promise((resolve) =>
-              setTimeout(resolve, queueFullRetryDelayMs)
-            );
-            result = await this.processPayment(p, options);
-          }
-          return result;
-        })
-      );
-
-      for (const res of batchResults) {
-        if (res.status === "fulfilled")
-          results.push({ success: true, data: res.value });
-        else results.push({ success: false, error: res.reason.message });
+  // ── Backpressure ─────────────────────────────────────────────────────────
+  // Hold until the Horizon-facing client reports it is not saturated, or the
+  // bounded wait elapses (so a stuck signal can never deadlock a batch).
+  async _awaitHorizonCapacity(maxWaitMs) {
+    if (!this.backpressureEnabled) return;
+    let waited = 0;
+    while (waited < maxWaitMs) {
+      let ready = true;
+      try {
+        ready = this.isHorizonReady();
+      } catch (_) {
+        ready = true;
       }
+      if (ready) return;
+      logger.warn("[PaymentProcessor] Horizon saturated — applying backpressure", {
+        waitedMs: waited,
+      });
+      await new Promise((r) => setTimeout(r, this.backpressureDelayMs));
+      waited += this.backpressureDelayMs;
+    }
+  }
+
+  // ── Batch Processing ─────────────────────────────────────────────────────
+  // Streaming worker pool: a fixed number of workers each pull the next item as
+  // soon as they finish, so one slow payment never stalls a whole chunk.
+  // Per-item failures are isolated into structured results — a single bad tx
+  // never aborts the batch — and backpressure is applied against Horizon
+  // saturation between dispatches. Outcomes are exported as metrics.
+  async processBatch(payments, options = {}) {
+    const items = Array.isArray(payments) ? payments : [];
+    const concurrencyLimit = Math.max(
+      1,
+      options.concurrencyLimit || this.batchConcurrencyLimit
+    );
+    const queueFullRetryDelayMs =
+      options.queueFullRetryDelayMs !== undefined
+        ? options.queueFullRetryDelayMs
+        : 500;
+    const maxBackpressureWaitMs =
+      options.maxBackpressureWaitMs !== undefined
+        ? options.maxBackpressureWaitMs
+        : this.maxBackpressureWaitMs;
+
+    const startedAt = Date.now();
+    const results = new Array(items.length);
+
+    const processOne = async (payment, index) => {
+      // Backpressure: yield to Horizon if it is saturated before dispatching.
+      await this._awaitHorizonCapacity(maxBackpressureWaitMs);
+
+      let result = await this.processPayment(payment, options);
+      // QUEUE_FULL is local saturation — retry the same item after a delay
+      // rather than counting it as a failure.
+      while (result && result.error && result.error.code === "QUEUE_FULL") {
+        logger.warn("[PaymentProcessor] Queue full, retrying after delay", {
+          index,
+          retryDelayMs: queueFullRetryDelayMs,
+        });
+        await new Promise((resolve) =>
+          setTimeout(resolve, queueFullRetryDelayMs)
+        );
+        await this._awaitHorizonCapacity(maxBackpressureWaitMs);
+        result = await this.processPayment(payment, options);
+      }
+      return result;
+    };
+
+    // Fixed pool of workers pulling from a shared cursor. A thrown error in one
+    // item is caught and recorded — it never rejects the pool or aborts peers.
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const index = cursor++;
+        if (index >= items.length) return;
+        try {
+          const value = await processOne(items[index], index);
+          // `success` reflects whether the call completed without throwing
+          // (Promise-level). `itemSuccess` is the business outcome — callers
+          // inspect it (or `data.success`) for per-item detail.
+          results[index] = {
+            success: true,
+            index,
+            itemSuccess: !!(value && value.success),
+            error:
+              value && !value.success && value.error
+                ? value.error.message
+                : null,
+            code: value && !value.success && value.error ? value.error.code : null,
+            data: value,
+          };
+        } catch (err) {
+          results[index] = {
+            success: false,
+            index,
+            itemSuccess: false,
+            error: err.message,
+          };
+        }
+      }
+    };
+
+    const poolSize = Math.min(concurrencyLimit, items.length);
+    await Promise.all(Array.from({ length: poolSize }, () => worker()));
+
+    // Promise-level counts (backward compatible): fulfilled vs thrown.
+    const successful = results.filter((r) => r && r.success).length;
+    const failed = results.length - successful;
+    // Business-level counts: payments that actually processed vs not.
+    const itemsSucceeded = results.filter((r) => r && r.itemSuccess).length;
+    const itemsFailed = results.length - itemsSucceeded;
+
+    // ── Batch metrics ──────────────────────────────────────────────────────
+    try {
+      const {
+        paymentBatchTotal,
+        paymentBatchItemsTotal,
+        paymentBatchDurationSeconds,
+      } = require("../metrics");
+      paymentBatchTotal.inc();
+      if (itemsSucceeded) paymentBatchItemsTotal.inc({ outcome: "success" }, itemsSucceeded);
+      if (itemsFailed) paymentBatchItemsTotal.inc({ outcome: "failed" }, itemsFailed);
+      paymentBatchDurationSeconds.observe((Date.now() - startedAt) / 1000);
+    } catch (_) {
+      // Metrics module not available — batch result is unaffected.
     }
 
     return {
-      total: payments.length,
-      successful: results.filter((r) => r.success).length,
-      failed: results.filter((r) => !r.success).length,
+      total: items.length,
+      successful,
+      failed,
+      itemsSucceeded,
+      itemsFailed,
+      durationMs: Date.now() - startedAt,
       results,
     };
   }
@@ -637,6 +758,8 @@ const concurrentPaymentProcessor = new ConcurrentPaymentProcessor({
   lockTimeoutMs: 30000,
   maxRetries: 3,
   maxQueueDepth: config.MAX_QUEUE_DEPTH,
+  // The live processor applies Horizon backpressure during batch processing.
+  backpressureEnabled: true,
 });
 
 module.exports = {

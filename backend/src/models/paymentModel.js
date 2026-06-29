@@ -35,6 +35,18 @@ const paymentSchema = new mongoose.Schema(
     senderAddress: { type: String, default: null },
     isSuspicious: { type: Boolean, default: false },
     suspicionReason: { type: String, default: null },
+    // Review workflow for flagged payments (issue #852). A flag starts as
+    // 'flagged'; an admin clears it (false positive → 'cleared', restoring the
+    // payment) or confirms it as fraud ('confirmed_fraud'). All transitions are
+    // captured in the audit log.
+    suspicionReviewStatus: {
+      type: String,
+      enum: ['flagged', 'cleared', 'confirmed_fraud'],
+      default: 'flagged',
+    },
+    suspicionReviewedBy: { type: String, default: null },
+    suspicionReviewedAt: { type: Date, default: null },
+    suspicionReviewNote: { type: String, default: null },
 
     ledger: { type: Number, default: null },
     ledgerSequence: { type: Number, default: null },

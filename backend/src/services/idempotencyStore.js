@@ -21,6 +21,15 @@ const logger = require('../utils/logger').child('IdempotencyStore');
 const TTL_SECONDS = IdempotencyKey.TTL_SECONDS;
 const REDIS_PREFIX = 'idem:';
 
+// How long an `in_progress` reservation is honored before it is considered
+// abandoned (e.g. the owning process crashed mid-request). After this window a
+// new request may take over the reservation and re-execute, rather than being
+// stuck behind a dead in-flight record until the 24h TTL purges it.
+const IN_FLIGHT_TTL_MS = parseInt(
+  process.env.IDEMPOTENCY_IN_FLIGHT_TTL_MS || '30000',
+  10
+);
+
 const redisEnabled = Boolean(process.env.REDIS_HOST);
 
 let redis = null;
@@ -118,4 +127,158 @@ async function set(key, record) {
   await redisSet(key, doc);
 }
 
-module.exports = { get, set, redisEnabled };
+/**
+ * Read the FULL record for a canonical key, including lifecycle state, request
+ * fingerprint, and createdAt. Unlike `get()` (which returns only the cached
+ * response and is kept response-shaped for the payment processor), this is what
+ * the HTTP idempotency middleware uses to make 200/409/422 decisions.
+ *
+ * @param {string} key canonical idempotency key
+ * @returns {Promise<{state:string, requestFingerprint:string|null, responseStatus:number|null, responseBody:*, scope:string, createdAt:Date}|null>}
+ */
+async function getFull(key) {
+  if (!key) return null;
+
+  // Redis only ever caches completed results (warmed by set()/complete()), so a
+  // hit is authoritative for the completed case and avoids a Mongo round-trip.
+  const cached = await redisGet(key);
+  if (cached && cached.state === 'completed') {
+    return {
+      state: 'completed',
+      requestFingerprint: cached.requestFingerprint || null,
+      responseStatus: cached.responseStatus,
+      responseBody: cached.responseBody,
+      scope: cached.scope || '',
+      createdAt: cached.createdAt ? new Date(cached.createdAt) : new Date(),
+    };
+  }
+
+  const record = await IdempotencyKey.findOne({ key }).lean();
+  if (!record) return null;
+
+  return {
+    state: record.state || 'completed',
+    requestFingerprint: record.requestFingerprint || null,
+    responseStatus: record.responseStatus,
+    responseBody: record.responseBody,
+    scope: record.scope || '',
+    createdAt: record.createdAt ? new Date(record.createdAt) : new Date(),
+  };
+}
+
+/**
+ * Atomically claim a key for an in-flight request. The unique index on `key`
+ * makes this a compare-and-set: exactly one concurrent request wins.
+ *
+ *  - { reserved: true }                 — caller owns the reservation; proceed.
+ *  - { reserved: false, record }        — another request already holds/holds-the
+ *                                         result for this key; caller should 409
+ *                                         (in_progress) or replay/422 (completed).
+ *
+ * A stale in_progress reservation (older than IN_FLIGHT_TTL_MS) is taken over
+ * atomically so a crashed request never wedges the key.
+ *
+ * @param {string} key canonical idempotency key
+ * @param {{scope?:string, fingerprint?:string|null}} opts
+ */
+async function reserve(key, { scope = '', fingerprint = null } = {}) {
+  if (!key) return { reserved: false, record: null };
+
+  try {
+    await IdempotencyKey.create({
+      key,
+      scope,
+      state: 'in_progress',
+      requestFingerprint: fingerprint,
+      responseStatus: null,
+      responseBody: null,
+    });
+    return { reserved: true };
+  } catch (err) {
+    if (err.code !== 11000) {
+      logger.error('Failed to reserve idempotency key', { error: err.message });
+      throw err;
+    }
+  }
+
+  // Key already exists — inspect it.
+  const existing = await getFull(key);
+  if (!existing) {
+    // Raced with a TTL purge between create and read; one more attempt.
+    try {
+      await IdempotencyKey.create({
+        key,
+        scope,
+        state: 'in_progress',
+        requestFingerprint: fingerprint,
+        responseStatus: null,
+        responseBody: null,
+      });
+      return { reserved: true };
+    } catch (_) {
+      return { reserved: false, record: await getFull(key) };
+    }
+  }
+
+  if (existing.state === 'in_progress') {
+    const age = Date.now() - existing.createdAt.getTime();
+    if (age >= IN_FLIGHT_TTL_MS) {
+      // Stale reservation — take it over atomically. The `state: in_progress`
+      // guard ensures we don't clobber a record that just completed.
+      const taken = await IdempotencyKey.findOneAndUpdate(
+        { key, state: 'in_progress' },
+        { $set: { scope, requestFingerprint: fingerprint, createdAt: new Date() } },
+        { new: true }
+      );
+      if (taken) return { reserved: true };
+      return { reserved: false, record: await getFull(key) };
+    }
+  }
+
+  return { reserved: false, record: existing };
+}
+
+/**
+ * Finalize a previously reserved key with the request's response, flipping it to
+ * `completed`. Upserts so it is also correct if no reservation existed.
+ *
+ * @param {string} key canonical idempotency key
+ * @param {{scope?:string, responseStatus:number, responseBody:*, fingerprint?:string|null}} record
+ */
+async function complete(key, record) {
+  if (!key) return;
+
+  const doc = {
+    scope: record.scope || '',
+    state: 'completed',
+    requestFingerprint: record.fingerprint || null,
+    responseStatus: record.responseStatus,
+    responseBody: record.responseBody,
+  };
+
+  await IdempotencyKey.findOneAndUpdate(
+    { key },
+    { $set: doc, $setOnInsert: { key, createdAt: new Date() } },
+    { upsert: true }
+  );
+
+  await redisSet(key, doc);
+}
+
+/**
+ * Release a reservation without storing a result, so the client may retry.
+ * Used when a request fails with a 5xx (which is never cached). Only deletes a
+ * record still in `in_progress` — never a completed one.
+ *
+ * @param {string} key canonical idempotency key
+ */
+async function release(key) {
+  if (!key) return;
+  try {
+    await IdempotencyKey.deleteOne({ key, state: 'in_progress' });
+  } catch (err) {
+    logger.warn('Failed to release idempotency reservation', { error: err.message });
+  }
+}
+
+module.exports = { get, set, getFull, reserve, complete, release, redisEnabled, IN_FLIGHT_TTL_MS };

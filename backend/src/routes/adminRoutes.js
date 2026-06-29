@@ -4,6 +4,12 @@ const express = require('express');
 const router = express.Router();
 const { setLogLevel } = require('../controllers/adminController');
 const { listDLQ, retryDLQEntry } = require('../controllers/webhookAdminController');
+const {
+  getBacklog,
+  listDeadLetterVerifications,
+  getDeadLetterVerification,
+  retryDeadLetterVerification,
+} = require('../controllers/pendingVerificationAdminController');
 const { requireAdminAuth } = require('../middleware/auth');
 const { auditContext } = require('../middleware/auditContext');
 
@@ -13,5 +19,11 @@ router.post('/log-level', requireAdminAuth, auditContext, setLogLevel);
 // Webhook dead-letter queue admin endpoints
 router.get('/webhooks/dlq', requireAdminAuth, listDLQ);
 router.post('/webhooks/dlq/:id/retry', requireAdminAuth, auditContext, retryDLQEntry);
+
+// Stellar verification retry backlog / dead-letter admin endpoints
+router.get('/pending-verifications/backlog', requireAdminAuth, getBacklog);
+router.get('/pending-verifications/dead-letter', requireAdminAuth, listDeadLetterVerifications);
+router.get('/pending-verifications/:id', requireAdminAuth, getDeadLetterVerification);
+router.post('/pending-verifications/:id/retry', requireAdminAuth, auditContext, retryDeadLetterVerification);
 
 module.exports = router;

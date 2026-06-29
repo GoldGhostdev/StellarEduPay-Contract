@@ -251,13 +251,58 @@ async function detectCrossSchoolMemoCollision(memo, schoolId, txDate) {
 }
 
 /**
+ * Compute the mean and (population) standard deviation of a school's confirmed,
+ * non-suspicious payment amounts within a lookback window. Used to base the
+ * suspicious-amount threshold on each tenant's OWN distribution rather than a
+ * flat multiplier off the expected fee.
+ *
+ * @param {string} schoolId
+ * @param {number} windowDays lookback window
+ * @returns {Promise<{count:number, mean:number, std:number}>}
+ */
+async function computeHistoricalAmountStats(schoolId, windowDays) {
+  const windowStart = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const rows = await Payment.aggregate([
+    {
+      $match: {
+        schoolId,
+        isSuspicious: false,
+        deletedAt: null,
+        confirmedAt: { $gte: windowStart },
+        amount: { $gt: 0 },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        mean: { $avg: "$amount" },
+        std: { $stdDevPop: "$amount" },
+      },
+    },
+  ]);
+
+  if (!rows.length) return { count: 0, mean: 0, std: 0 };
+  return {
+    count: rows[0].count || 0,
+    mean: rows[0].mean || 0,
+    std: rows[0].std || 0,
+  };
+}
+
+/**
  * Detect abnormal payment patterns:
  *  1. Rapid repeated transactions — same sender sends more than RAPID_TX_LIMIT
  *     payments within RAPID_TX_WINDOW_MS.
- *  2. Unusual amount — payment deviates from the expected fee by more than
- *     the school's configured multiplier (default 3×).
+ *  2. Unusual amount — by default the payment deviates from the expected fee by
+ *     more than the school's configured multiplier (default 3×). When the
+ *     school opts into historical mode (`amountConfig.mode === 'historical'`)
+ *     and enough history exists, the threshold is a z-score against the
+ *     school's own confirmed-payment distribution instead.
  *
  * Returns { suspicious: boolean, reason: string|null }
+ *
+ * @param {object|null} amountConfig per-tenant suspiciousAmountConfig (optional)
  */
 async function detectAbnormalPatterns(
   senderAddress,
@@ -266,6 +311,7 @@ async function detectAbnormalPatterns(
   txDate,
   schoolId,
   suspiciousPaymentMultiplier = 3.0,
+  amountConfig = null,
 ) {
   const RAPID_TX_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
   const RAPID_TX_LIMIT = 3; // more than this many = suspicious
@@ -288,13 +334,41 @@ async function detectAbnormalPatterns(
     }
   }
 
-  // 2. Unusual amount check — uses school's configured multiplier
-  if (expectedFee && expectedFee > 0) {
+  // 2. Unusual amount check.
+  // 2a. Historical mode — flag amounts far from the school's own mean. Falls
+  //     back to the fee-multiplier check below if there isn't enough history.
+  let historicalApplied = false;
+  if (amountConfig && amountConfig.mode === "historical" && schoolId) {
+    const windowDays = amountConfig.historicalWindowDays || 90;
+    const stdMultiplier = amountConfig.historicalStdDevMultiplier || 3.0;
+    const minSamples = amountConfig.historicalMinSamples || 20;
+
+    try {
+      const stats = await computeHistoricalAmountStats(schoolId, windowDays);
+      if (stats.count >= minSamples && stats.std > 0) {
+        historicalApplied = true;
+        const zScore = Math.abs(paymentAmount - stats.mean) / stats.std;
+        if (zScore >= stdMultiplier) {
+          reasons.push(
+            `Unusual payment amount (z-score ${zScore.toFixed(2)} vs school mean ${stats.mean.toFixed(2)}, threshold ${stdMultiplier.toFixed(1)}σ over ${stats.count} payments)`,
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn("Historical suspicious-amount check failed; falling back to fee multiplier", {
+        schoolId,
+        error: err.message,
+      });
+    }
+  }
+
+  // 2b. Fee-multiplier mode (default, and the historical fallback).
+  if (!historicalApplied && expectedFee && expectedFee > 0) {
     const ratio = paymentAmount / expectedFee;
     const lowerThreshold = 1 / suspiciousPaymentMultiplier;
     // For multiplier 5.0, use exclusive boundary; for others, use inclusive
     const lowerBoundExclusive = Math.abs(suspiciousPaymentMultiplier - 5.0) < 0.01;
-    
+
     if (
       ratio >= suspiciousPaymentMultiplier ||
       (lowerBoundExclusive ? ratio < lowerThreshold : ratio <= lowerThreshold)
@@ -891,6 +965,7 @@ module.exports = {
   detectMemoCollision,
   detectCrossSchoolMemoCollision,
   detectAbnormalPatterns,
+  computeHistoricalAmountStats,
   checkConfirmationStatus,
   // recordPayment was moved to transactionService.savePayment (db layer split);
   // re-exported under its original name since paymentController, retryService,

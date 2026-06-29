@@ -84,10 +84,18 @@ async function processTransaction(tx, school) {
   // Check for suspicious activity
   const collision = await detectMemoCollision(memo, senderAddress, paymentAmount, student.feeAmount, txDate, schoolId);
   const crossSchoolCollision = await detectCrossSchoolMemoCollision(memo, schoolId, txDate);
-  const abnormal = await detectAbnormalPatterns(senderAddress, paymentAmount, student.feeAmount, txDate, schoolId, school.suspiciousPaymentMultiplier);
+  const abnormal = await detectAbnormalPatterns(senderAddress, paymentAmount, student.feeAmount, txDate, schoolId, school.suspiciousPaymentMultiplier, school.suspiciousAmountConfig);
 
   const isSuspicious = collision.suspicious || crossSchoolCollision.suspicious || abnormal.suspicious;
   const suspicionReason = [collision.reason, crossSchoolCollision.reason, abnormal.reason].filter(Boolean).join('; ') || null;
+
+  if (isSuspicious) {
+    try {
+      require('../metrics').suspiciousPaymentFlagged.inc({ school_id: schoolId });
+    } catch (_) {
+      // metrics module unavailable — flagging still proceeds
+    }
+  }
 
   const confirmation = await determineConfirmationState(
     txLedger,

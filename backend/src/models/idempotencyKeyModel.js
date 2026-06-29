@@ -25,8 +25,22 @@ const idempotencyKeySchema = new mongoose.Schema({
   // 'payment-processor'). The scope is already baked into `key`; this is kept
   // for debuggability and is not part of the lookup.
   scope: { type: String, default: '' },
-  responseStatus: { type: Number, required: true },
-  responseBody: { type: mongoose.Schema.Types.Mixed, required: true },
+  // Lifecycle of the record:
+  //   in_progress — a request is currently executing under this key. A concurrent
+  //                 duplicate that finds an in_progress record is rejected with 409
+  //                 (rather than double-executing) until the first request finishes.
+  //   completed   — the request finished and `responseStatus`/`responseBody` hold the
+  //                 cached result to replay.
+  // Defaults to 'completed' so records written directly via the store's set()
+  // (e.g. the payment processor) behave exactly as before.
+  state: { type: String, enum: ['in_progress', 'completed'], default: 'completed' },
+  // sha256 fingerprint of the canonicalized request body. Used to detect the
+  // same key being replayed with a *different* body (answered with 422). Null
+  // for records written without a body fingerprint (back-compat).
+  requestFingerprint: { type: String, default: null },
+  // Not required: an in_progress reservation has no response yet.
+  responseStatus: { type: Number, default: null },
+  responseBody: { type: mongoose.Schema.Types.Mixed, default: null },
   createdAt: { type: Date, default: Date.now, expires: TTL_SECONDS },
 });
 

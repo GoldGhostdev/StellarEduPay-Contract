@@ -37,6 +37,7 @@ const {
   getQueueJobStatus,
   getStuckPayments,
   updatePaymentStatus,
+  reviewSuspiciousPayment,
   streamPaymentEvents,
 } = require('../controllers/paymentAdminController');
 
@@ -193,5 +194,6 @@ router.post("/:paymentId/lock", lockPaymentForUpdate);
 router.post("/:paymentId/unlock", unlockPayment);
 
 router.patch("/:txHash/status", requireAdminAuth, auditContext, updatePaymentStatus);
+router.patch("/:txHash/suspicion-review", requireAdminAuth, auditContext, reviewSuspiciousPayment);
 
 module.exports = router;

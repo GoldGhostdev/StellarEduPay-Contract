@@ -52,7 +52,39 @@ function deriveIdempotencyKey(rawKey, scope = '') {
     .digest('hex');
 }
 
+/**
+ * Stable, order-independent stringification of a value so that two requests
+ * carrying the same logical payload (but with object keys in a different order)
+ * produce the same fingerprint. Arrays preserve order; object keys are sorted.
+ */
+function canonicalize(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value === undefined ? null : value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(',')}]`;
+  }
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
+}
+
+/**
+ * Fingerprint a request body so the idempotency layer can detect when the same
+ * `Idempotency-Key` is replayed with a *different* payload (which is a client
+ * bug, not a safe retry). Returns a hex sha256 of the canonicalized body, or
+ * the empty-body fingerprint when there is no body.
+ *
+ * @param {*} body parsed request body (object, array, primitive, or undefined)
+ * @returns {string} hex sha256 fingerprint
+ */
+function fingerprintRequest(body) {
+  const canonical = body === undefined ? 'null' : canonicalize(body);
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
 module.exports = {
   normalizeClientKey,
   deriveIdempotencyKey,
+  canonicalize,
+  fingerprintRequest,
 };

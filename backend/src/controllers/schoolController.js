@@ -20,7 +20,7 @@ function isValidTimezone(tz) {
 // POST /api/schools
 async function createSchool(req, res, next) {
   try {
-    const { name, slug, stellarAddress, network, adminEmail, address, timezone, suspiciousPaymentMultiplier } = req.body;
+    const { name, slug, stellarAddress, network, adminEmail, address, timezone, suspiciousPaymentMultiplier, suspiciousAmountConfig } = req.body;
 
     const errors = [];
     if (!name || typeof name !== 'string' || !name.trim())
@@ -61,6 +61,7 @@ async function createSchool(req, res, next) {
       address: address || null,
       ...(timezone !== undefined && { timezone }),
       ...(suspiciousPaymentMultiplier !== undefined && { suspiciousPaymentMultiplier }),
+      ...(suspiciousAmountConfig !== undefined && { suspiciousAmountConfig }),
     });
 
     // Audit log
@@ -156,7 +157,7 @@ async function getSchool(req, res, next) {
 // PATCH /api/schools/:schoolSlug
 async function updateSchool(req, res, next) {
   try {
-    const allowed = ['name', 'stellarAddress', 'network', 'adminEmail', 'address', 'suspiciousPaymentMultiplier'];
+    const allowed = ['name', 'stellarAddress', 'network', 'adminEmail', 'address', 'suspiciousPaymentMultiplier', 'suspiciousAmountConfig'];
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
@@ -202,6 +203,17 @@ async function updateSchool(req, res, next) {
           error: 'suspiciousPaymentMultiplier must be a number between 1.1 and 100',
           code: 'INVALID_SUSPICIOUS_PAYMENT_MULTIPLIER',
         });
+      }
+    }
+
+    // Validate suspiciousAmountConfig if being updated
+    if (updates.suspiciousAmountConfig !== undefined) {
+      const cfg = updates.suspiciousAmountConfig;
+      if (typeof cfg !== 'object' || cfg === null || Array.isArray(cfg)) {
+        return res.status(400).json({ error: 'suspiciousAmountConfig must be an object', code: 'INVALID_SUSPICIOUS_AMOUNT_CONFIG' });
+      }
+      if (cfg.mode !== undefined && !['fee_multiplier', 'historical'].includes(cfg.mode)) {
+        return res.status(400).json({ error: "suspiciousAmountConfig.mode must be 'fee_multiplier' or 'historical'", code: 'INVALID_SUSPICIOUS_AMOUNT_CONFIG' });
       }
     }
 

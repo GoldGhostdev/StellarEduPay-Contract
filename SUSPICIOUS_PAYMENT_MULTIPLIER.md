@@ -258,6 +258,49 @@ npm test -- suspiciousPaymentMultiplier.test.js
 
 **Test Results:** 50/50 passing ✅
 
+## Historical-Distribution Thresholds (per tenant)
+
+A flat fee multiplier mis-fires for schools whose normal payments cluster
+differently from the expected fee. Each school can opt into a threshold based on
+its **own** confirmed-payment distribution via `suspiciousAmountConfig`:
+
+```json
+PATCH /api/schools/:slug
+{
+  "suspiciousAmountConfig": {
+    "mode": "historical",
+    "historicalWindowDays": 90,
+    "historicalStdDevMultiplier": 3.0,
+    "historicalMinSamples": 20
+  }
+}
+```
+
+- `mode: 'fee_multiplier'` (default) — the legacy behavior above.
+- `mode: 'historical'` — flags a payment when its amount is more than
+  `historicalStdDevMultiplier` standard deviations from the school's mean
+  confirmed-payment amount over the last `historicalWindowDays` days. Until the
+  school has at least `historicalMinSamples` confirmed payments, detection falls
+  back to the fee multiplier (avoiding cold-start false positives).
+
+## Review / Clear Workflow
+
+Flagged payments are reviewable and clearable, with every decision audited:
+
+- `GET  /api/payments/suspicious` — list flagged payments for the school.
+- `PATCH /api/payments/:txHash/suspicion-review` — body `{ "action": "clear" | "confirm_fraud", "note": "..." }`.
+  - `clear` removes the suspicious flag (false positive); the payment leaves the queue.
+  - `confirm_fraud` records the determination and keeps the flag.
+  - Each review writes a `payment_suspicion_review` audit log entry (reviewer, before/after, note).
+
+The review status lives on the payment (`suspicionReviewStatus`,
+`suspicionReviewedBy`, `suspicionReviewedAt`, `suspicionReviewNote`).
+
+## Metrics
+
+`suspicious_payment_flagged{school_id}` — a Prometheus counter incremented each
+time a payment is flagged, so flagged volume is alertable per tenant.
+
 ## Future Enhancements
 
 Potential improvements for future iterations:
