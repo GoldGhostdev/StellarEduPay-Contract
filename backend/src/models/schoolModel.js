@@ -158,10 +158,13 @@ const schoolSchema = new mongoose.Schema(
      * SystemConfig global default for this school only.
      *
      * Supported keys:
-     *   maxSyncBatchSize   — max transactions per polling cycle (number)
-     *   reminderEnabled    — enable/disable fee reminder emails (boolean)
-     *   reminderIntervalMs — how often reminder scheduler runs (number, ms)
-     *   betaFeatures       — array of opted-in beta feature flags (string[])
+     *   maxSyncBatchSize     — max transactions per polling cycle (number)
+     *   reminderEnabled      — enable/disable fee reminder emails (boolean)
+     *   reminderIntervalMs   — how often reminder scheduler runs (number, ms)
+     *   reminderTimeWindow   — { startHour, endHour } defining the local-time
+     *                          window during which reminders may be sent
+     *                          (default: { startHour: 8, endHour: 18 })
+     *   betaFeatures         — array of opted-in beta feature flags (string[])
      */
     settings: {
       type: mongoose.Schema.Types.Mixed,

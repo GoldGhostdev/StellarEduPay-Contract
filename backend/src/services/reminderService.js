@@ -47,9 +47,15 @@ function isSmtpConfigured() {
 
 /**
  * Return true if the current wall-clock time in the given IANA timezone falls
- * within business hours (08:00–17:59 local time).
+ * within the school's configured send window.
+ *
+ * The window is read from school.settings.reminderTimeWindow:
+ *   { startHour: 8, endHour: 18 }  (default, meaning 08:00–17:59 local time)
+ *
+ * When the setting is absent or malformed the default 08:00–17:59 window is used.
  */
-function isBusinessHours(timezone = 'UTC') {
+function isInSendWindow(school) {
+  const timezone = school.timezone || 'UTC';
   const now = new Date();
   const hour = parseInt(
     new Intl.DateTimeFormat('en-US', {
@@ -59,7 +65,13 @@ function isBusinessHours(timezone = 'UTC') {
     }).format(now),
     10
   );
-  return hour >= 8 && hour < 18;
+
+  const defaults = { startHour: 8, endHour: 18 };
+  const win = (school.settings && school.settings.reminderTimeWindow) || {};
+  const startHour = (win.startHour != null ? win.startHour : defaults.startHour);
+  const endHour   = (win.endHour   != null ? win.endHour   : defaults.endHour);
+
+  return hour >= startHour && hour < endHour;
 }
 
 /**
@@ -104,10 +116,19 @@ async function processReminders() {
   summary.schools = schools.length;
 
   for (const school of schools) {
-    const schoolTimezone = school.timezone || 'UTC';
+    // Per-school reminder kill switch
+    if (school.settings && school.settings.reminderEnabled === false) {
+      logger.debug('Reminders disabled for school', { schoolId: school.schoolId });
+      summary.skipped++;
+      continue;
+    }
 
-    if (!isBusinessHours(schoolTimezone)) {
-      logger.info('Outside business hours — skipping school', { schoolId: school.schoolId, timezone: schoolTimezone });
+    if (!isInSendWindow(school)) {
+      logger.info('Outside send window — skipping school', {
+        schoolId: school.schoolId,
+        timezone: school.timezone || 'UTC',
+        window:   (school.settings && school.settings.reminderTimeWindow) || { startHour: 8, endHour: 18 },
+      });
       summary.skipped++;
       continue;
     }
@@ -243,8 +264,11 @@ function startReminderScheduler() {
   }
   
   logger.info(`Starting — interval: ${REMINDER_INTERVAL_MS}ms, cooldown: ${REMINDER_COOLDOWN_HOURS}h, maxCount: ${REMINDER_MAX_COUNT}`);
-  // Do NOT run immediately on startup — wait for the first interval so the
-  // server has time to fully initialise and we don't blast emails on every restart.
+
+  // Run once immediately so we don't wait a full interval on startup.
+  // Each school's send window gate prevents blasting outside local hours.
+  setImmediate(() => runReminders().catch(err => logger.error('Initial reminder run failed', { error: err.message })));
+
   _timer = setInterval(runReminders, REMINDER_INTERVAL_MS);
   _timer.unref(); // don't block process exit
 }

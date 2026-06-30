@@ -159,9 +159,11 @@ if (!JWT_SECRET || JWT_SECRET.length < JWT_SECRET_MIN_LENGTH) {
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "8h";
 
 // ── Fee Reminders ─────────────────────────────────────────────────────────────
-// How often the scheduler checks for unpaid fees (default: 24 hours)
+// How often the scheduler checks for unpaid fees (default: 1 hour).
+// Schools are only processed during their configured send window, so a shorter
+// interval ensures every school gets picked up at the right local time.
 const REMINDER_INTERVAL_MS = parseInt(
-  process.env.REMINDER_INTERVAL_MS || String(24 * 60 * 60 * 1000),
+  process.env.REMINDER_INTERVAL_MS || String(60 * 60 * 1000),
   10,
 );
 // Minimum hours between reminders for the same student (default: 48 hours)
