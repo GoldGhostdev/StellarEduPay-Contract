@@ -8,13 +8,23 @@
  *   - Secondary provider: Coinbase Exchange (/exchange-rates) — used
  *     automatically when CoinGecko fails or returns invalid data.
  *   - Redis-backed shared cache (keyed by `currency:rates:<CURRENCY>`).
- *     Falls back to in-process Map when Redis is unavailable, so each replica
- *     does not independently hammer the price feed.
+ *     Falls back to in-process LRU Map when Redis is unavailable, so each
+ *     replica does not independently hammer the price feed.
  *   - All logging via logger.child('CurrencyConversion') — no console.warn.
  *   - Prometheus gauges: price_feed_available{provider} and
  *     price_feed_staleness_seconds{provider}.
  *   - Stale-while-revalidate: serve stale cache when both providers fail,
  *     up to PRICE_STALE_THRESHOLD_MS (default 1 hour).
+ *
+ * Fix #888:
+ *   - In-process fallback cache is now a bounded LRU (CURRENCY_LRU_MAX_SIZE,
+ *     default 50). Once full, the least-recently-used entry is evicted, so
+ *     memory growth is capped regardless of how many distinct currencies are
+ *     seen.
+ *   - Supported fiat currencies are enforced via an allowlist
+ *     (ALLOWED_FIAT_CURRENCIES env var, comma-separated). Requests for
+ *     currencies outside the allowlist are rejected immediately without
+ *     hitting the price feed or the cache.
  */
 
 const https = require("https");
@@ -34,9 +44,63 @@ const COINGECKO_API_KEY        = process.env.COINGECKO_API_KEY || null;
 const SUPPORTED_CURRENCIES_TTL_MS =
   parseInt(process.env.SUPPORTED_CURRENCIES_TTL_MS || "3600000", 10); // 1 hour
 
+// Maximum number of distinct currencies to keep in the in-process LRU cache.
+// When the limit is reached the least-recently-used entry is evicted.
+const CURRENCY_LRU_MAX_SIZE = parseInt(process.env.CURRENCY_LRU_MAX_SIZE || "50", 10);
+
 // Redis cache TTL in seconds (slightly longer than in-memory TTL to allow
 // cross-replica stale-while-revalidate).
 const REDIS_CACHE_TTL_S = Math.ceil(PRICE_STALE_THRESHOLD_MS / 1000);
+
+// ── Currency allowlist ────────────────────────────────────────────────────────
+//
+// ALLOWED_FIAT_CURRENCIES can be set as a comma-separated env var to restrict
+// which target currencies the service will accept.  When the env var is absent
+// the service defaults to a curated set of widely-supported fiat currencies.
+//
+// Keeping an explicit allowlist serves two purposes:
+//   1. Prevents cache pollution from arbitrary/typo currency codes.
+//   2. Avoids CoinGecko/Coinbase calls that are guaranteed to fail for
+//      unsupported or non-existent currency identifiers.
+
+const _DEFAULT_ALLOWED_FIAT = new Set([
+  "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "HKD", "NZD",
+  "SEK", "KRW", "SGD", "NOK", "MXN", "INR", "RUB", "ZAR", "BRL", "TRY",
+  "TWD", "DKK", "PLN", "THB", "IDR", "HUF", "CZK", "ILS", "CLP", "PHP",
+  "AED", "COP", "SAR", "MYR", "RON", "PGK", "NGN", "GHS", "KES", "UGX",
+  "TZS", "ETB", "RWF", "XOF", "XAF", "MAD", "EGP", "PKR", "BDT", "VND",
+]);
+
+/**
+ * Build the runtime allowlist from the ALLOWED_FIAT_CURRENCIES env var or
+ * fall back to _DEFAULT_ALLOWED_FIAT.  Returns a Set<string> of uppercase
+ * currency codes.
+ */
+function _buildAllowlist() {
+  const raw = process.env.ALLOWED_FIAT_CURRENCIES;
+  if (!raw || !raw.trim()) return _DEFAULT_ALLOWED_FIAT;
+  const codes = raw
+    .split(",")
+    .map((c) => c.trim().toUpperCase())
+    .filter(Boolean);
+  if (codes.length === 0) return _DEFAULT_ALLOWED_FIAT;
+  return new Set(codes);
+}
+
+// Evaluated once at module load; tests may call _resetAllowlist() to rebuild
+// after changing the env var.
+let ALLOWED_FIAT_CURRENCIES = _buildAllowlist();
+
+function _resetAllowlist() {
+  ALLOWED_FIAT_CURRENCIES = _buildAllowlist();
+}
+
+/**
+ * Returns true when `currency` (already uppercased) is in the allowlist.
+ */
+function _isCurrencyAllowed(currency) {
+  return ALLOWED_FIAT_CURRENCIES.has(currency);
+}
 
 // ── Prometheus metrics ───────────────────────────────────────────────────────
 
@@ -82,10 +146,66 @@ function _recordStaleness(provider, lastSuccessfulFetchMs) {
   }
 }
 
-// ── In-process cache (fallback when Redis unavailable) ───────────────────────
-// Structure: Map<CURRENCY, { rates, fetchedAt (ms), lastSuccessfulFetch (ms) }>
+// ── In-process LRU cache (fallback when Redis unavailable) ───────────────────
+//
+// LruMap is a minimal least-recently-used Map backed by the native Map whose
+// insertion/access order we maintain explicitly:
+//   - On get: delete then re-insert so the key moves to the "most recent" end.
+//   - On set: same re-insert pattern, then evict the oldest entry when over cap.
+//
+// This gives O(1) get/set/evict with no external dependencies.
+//
+// Structure: LruMap<CURRENCY, { rates, fetchedAt (ms), lastSuccessfulFetch (ms) }>
 
-const _localCache = new Map();
+class LruMap {
+  constructor(maxSize) {
+    this._max  = Math.max(1, maxSize);
+    this._map  = new Map();
+  }
+
+  has(key) {
+    return this._map.has(key);
+  }
+
+  get(key) {
+    if (!this._map.has(key)) return undefined;
+    // Move to most-recently-used position.
+    const value = this._map.get(key);
+    this._map.delete(key);
+    this._map.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this._map.has(key)) this._map.delete(key);
+    this._map.set(key, value);
+    // Evict the oldest (first) entry when over capacity.
+    if (this._map.size > this._max) {
+      const oldest = this._map.keys().next().value;
+      this._map.delete(oldest);
+      logger.debug("LRU local cache evicted", { evicted: oldest, size: this._map.size });
+    }
+  }
+
+  delete(key) {
+    return this._map.delete(key);
+  }
+
+  clear() {
+    this._map.clear();
+  }
+
+  get size() {
+    return this._map.size;
+  }
+
+  /** Iterate over [key, value] pairs — for getCachedRates() compatibility. */
+  [Symbol.iterator]() {
+    return this._map[Symbol.iterator]();
+  }
+}
+
+const _localCache = new LruMap(CURRENCY_LRU_MAX_SIZE);
 
 // ── In-flight deduplication ──────────────────────────────────────────────────
 const _inFlight = new Map();
@@ -283,6 +403,12 @@ async function _fetchRates(currency) {
 async function getRates(currency) {
   const key = currency.toUpperCase();
 
+  // Reject unsupported currencies immediately — don't hit the price feed or
+  // the cache for codes that will never succeed (fix #888 allowlist).
+  if (!_isCurrencyAllowed(key)) {
+    throw new Error(`Currency "${key}" is not in the supported fiat allowlist`);
+  }
+
   // Return from cache if fresh.
   const cached = await _readCache(key);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
@@ -324,6 +450,13 @@ async function getRates(currency) {
 
 async function convertToLocalCurrency(amount, assetCode = "XLM", targetCurrency = "USD") {
   const currency  = targetCurrency.toUpperCase();
+
+  // Fast-path: reject unsupported currencies without touching the cache or feed.
+  if (!_isCurrencyAllowed(currency)) {
+    logger.warn("Currency not in allowlist", { currency });
+    return { localAmount: null, currency, rate: null, rateTimestamp: null, available: false, stale: false, staleAge: null, unsupportedCurrency: true };
+  }
+
   const rateEntry = await getRates(currency);
 
   if (!rateEntry) {
@@ -387,6 +520,7 @@ function getCachedRates() {
 
 function resetCache() {
   _localCache.clear();
+  _inFlight.clear();
 }
 
 // Back-compat aliases
@@ -439,4 +573,7 @@ module.exports = {
   _fetchRatesFromCoinGecko: (c) => _fetchFromCoinGecko(c),
   _getRates: getRates,
   _getCache: getCachedRates,
+  _resetAllowlist,
+  _getAllowlist: () => ALLOWED_FIAT_CURRENCIES,
+  _getLocalCacheSize: () => _localCache.size,
 };

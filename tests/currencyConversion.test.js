@@ -303,9 +303,154 @@ it('currencyConversionService suite', async () => {
     }
   });
 
+  // ── 11. Currency allowlist (fix #888) ────────────────────────────────────
+
+  await test('rejects an unsupported fiat currency (returns available:false)', async () => {
+    svc.resetCache();
+    // NOTREAL is not in the default allowlist.
+    const result = await svc.convertToLocalCurrency(10, 'XLM', 'NOTREAL');
+    assert.strictEqual(result.available, false);
+    assert.strictEqual(result.localAmount, null);
+    assert.strictEqual(result.unsupportedCurrency, true);
+  });
+
+  await test('getRates throws for unsupported currency', async () => {
+    svc.resetCache();
+    let threw = false;
+    try {
+      await svc._getRates('BOGUS');
+    } catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('allowlist'), `Expected allowlist in: "${err.message}"`);
+    }
+    assert.ok(threw, 'Expected getRates to throw for unsupported currency');
+  });
+
+  await test('respects ALLOWED_FIAT_CURRENCIES env var override', async () => {
+    // Override the allowlist to only allow EUR.
+    const prev = process.env.ALLOWED_FIAT_CURRENCIES;
+    process.env.ALLOWED_FIAT_CURRENCIES = 'EUR';
+    svc._resetAllowlist();
+    try {
+      // USD should now be rejected.
+      const resultUsd = await svc.convertToLocalCurrency(10, 'XLM', 'USD');
+      assert.strictEqual(resultUsd.available, false);
+      assert.strictEqual(resultUsd.unsupportedCurrency, true);
+
+      // EUR should be allowed.
+      const restore = mockHttpsGet({ stellar: { eur: 0.22 }, 'usd-coin': { eur: 0.92 } });
+      try {
+        const resultEur = await svc.convertToLocalCurrency(10, 'XLM', 'EUR');
+        assert.strictEqual(resultEur.available, true);
+        assert.strictEqual(resultEur.currency, 'EUR');
+      } finally {
+        restore();
+      }
+    } finally {
+      // Restore env and allowlist.
+      if (prev === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+      else process.env.ALLOWED_FIAT_CURRENCIES = prev;
+      svc._resetAllowlist();
+      svc.resetCache();
+    }
+  });
+
+  await test('allowlist contains major fiat currencies by default', () => {
+    const allowlist = svc._getAllowlist();
+    for (const code of ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'PGK']) {
+      assert.ok(allowlist.has(code), `Expected default allowlist to include ${code}`);
+    }
+  });
+
+  // ── 12. Bounded LRU (fix #888) ────────────────────────────────────────────
+  // NOTE: These tests need a fresh module with CURRENCY_LRU_MAX_SIZE=2.
+  //       They are defined as top-level it() blocks below the main suite
+  //       to avoid Jest environment teardown issues.
+
   // ── Summary ───────────────────────────────────────────────────────────────
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);
 })();
 }, 30000);
+
+// ── LRU standalone tests (top-level it() blocks) ─────────────────────────────
+// These require a fresh module load with a custom CURRENCY_LRU_MAX_SIZE so they
+// must live outside the IIFE to ensure proper Jest lifecycle ordering.
+
+it('LRU cache evicts oldest entry when maxSize is exceeded', async () => {
+  let svcSmall;
+  const origMax = process.env.CURRENCY_LRU_MAX_SIZE;
+  const origAllowed = process.env.ALLOWED_FIAT_CURRENCIES;
+  process.env.CURRENCY_LRU_MAX_SIZE = '2';
+  process.env.ALLOWED_FIAT_CURRENCIES = 'USD,EUR,AA1,AA2,AA3';
+
+  // Use jest.isolateModules to get a fresh module that reads the new env vars.
+  jest.isolateModules(() => {
+    svcSmall = require('../backend/src/services/currencyConversionService');
+  });
+
+  try {
+    // Seed three entries: AA1, AA2, AA3 (LRU max = 2).
+    for (const [code, xlm] of [['AA1', 0.1], ['AA2', 0.2], ['AA3', 0.3]]) {
+      const restore = mockHttpsGet({ stellar: { [code.toLowerCase()]: xlm }, 'usd-coin': { [code.toLowerCase()]: 1.0 } });
+      try {
+        await svcSmall.convertToLocalCurrency(1, 'XLM', code);
+      } finally {
+        restore();
+      }
+    }
+
+    // Cache should have at most 2 entries.
+    assert.ok(
+      svcSmall._getLocalCacheSize() <= 2,
+      `Expected LRU size <= 2, got ${svcSmall._getLocalCacheSize()}`
+    );
+    // Oldest entry (AA1) should have been evicted.
+    const cached = svcSmall.getCachedRates();
+    assert.ok(!cached['AA1'], 'AA1 should have been evicted as the oldest entry');
+    assert.ok(cached['AA3'], 'AA3 (most recent) should still be in cache');
+  } finally {
+    if (origMax === undefined) delete process.env.CURRENCY_LRU_MAX_SIZE;
+    else process.env.CURRENCY_LRU_MAX_SIZE = origMax;
+    if (origAllowed === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+    else process.env.ALLOWED_FIAT_CURRENCIES = origAllowed;
+  }
+}, 10000);
+
+it('LRU cache promotes accessed entry (LRU order)', async () => {
+  let svcLru;
+  const origMax = process.env.CURRENCY_LRU_MAX_SIZE;
+  const origAllowed = process.env.ALLOWED_FIAT_CURRENCIES;
+  process.env.CURRENCY_LRU_MAX_SIZE = '2';
+  process.env.ALLOWED_FIAT_CURRENCIES = 'B1,B2,B3';
+
+  jest.isolateModules(() => {
+    svcLru = require('../backend/src/services/currencyConversionService');
+  });
+
+  try {
+    // Seed B1, B2.
+    for (const [code, xlm] of [['B1', 0.1], ['B2', 0.2]]) {
+      const restore = mockHttpsGet({ stellar: { [code.toLowerCase()]: xlm }, 'usd-coin': { [code.toLowerCase()]: 1.0 } });
+      try { await svcLru.convertToLocalCurrency(1, 'XLM', code); } finally { restore(); }
+    }
+
+    // Access B1 to make it the most recently used (cache hit — no network call).
+    await svcLru.convertToLocalCurrency(1, 'XLM', 'B1');
+
+    // Now add B3 — should evict B2 (the LRU), not B1.
+    const restore3 = mockHttpsGet({ stellar: { b3: 0.3 }, 'usd-coin': { b3: 1.0 } });
+    try { await svcLru.convertToLocalCurrency(1, 'XLM', 'B3'); } finally { restore3(); }
+
+    const cached = svcLru.getCachedRates();
+    assert.ok(!cached['B2'], 'B2 (LRU after B1 was accessed) should have been evicted');
+    assert.ok(cached['B1'], 'B1 (recently accessed) should still be in cache');
+    assert.ok(cached['B3'], 'B3 (most recently set) should be in cache');
+  } finally {
+    if (origMax === undefined) delete process.env.CURRENCY_LRU_MAX_SIZE;
+    else process.env.CURRENCY_LRU_MAX_SIZE = origMax;
+    if (origAllowed === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+    else process.env.ALLOWED_FIAT_CURRENCIES = origAllowed;
+  }
+}, 10000);
