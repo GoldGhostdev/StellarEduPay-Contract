@@ -4,6 +4,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
+const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 
 const WebhookRetry = require('../models/webhookRetryModel');
@@ -17,6 +18,21 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 65_536; // 64 KB
 const REPLAY_WINDOW_S = parseInt(process.env.WEBHOOK_REPLAY_WINDOW_S || '300', 10);
 const WEBHOOK_MAX_ATTEMPTS = parseInt(process.env.WEBHOOK_MAX_ATTEMPTS || '3', 10);
+
+// ── Lease / stuck-recovery — Issue #74 ───────────────────────────────────────
+//
+// LEASE_TIMEOUT_MS: how long a 'processing' lease is considered valid. After
+// this duration, processPendingRetries() resets the document to 'pending' so
+// another worker can pick it up. Must be comfortably larger than
+// WEBHOOK_TIMEOUT_MS to avoid false recovery while the HTTP call is in flight.
+const LEASE_TIMEOUT_MS = parseInt(
+  process.env.WEBHOOK_LEASE_TIMEOUT_MS || String(WEBHOOK_TIMEOUT_MS * 3),
+  10,
+);
+
+// Stable worker identifier used as leasedBy. Helps ops trace which replica
+// held a lease.
+const WORKER_ID = `${os.hostname()}:${process.pid}`;
 
 // ── In-process replay-protection nonce store ─────────────────────────────────
 const _localNonces = new Map();
@@ -458,19 +474,67 @@ async function queueWebhookRetry(url, event, payload, error, secret = null, deli
   });
 }
 
+/**
+ * Recover stuck processing leases — Issue #74.
+ *
+ * Finds 'processing' documents whose leasedAt is older than LEASE_TIMEOUT_MS
+ * and resets them to 'pending' so another worker can pick them up. Safe to run
+ * concurrently across replicas — the findOneAndUpdate filter ensures only one
+ * worker reclaims each stuck document.
+ */
+async function recoverStuckLeases() {
+  const cutoff = new Date(Date.now() - LEASE_TIMEOUT_MS);
+  let recovered = 0;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const doc = await WebhookRetry.findOneAndUpdate(
+      { status: 'processing', leasedAt: { $lt: cutoff } },
+      { $set: { status: 'pending', leasedAt: null, leasedBy: null } },
+      { new: true }
+    );
+    if (!doc) break;
+    logger.warn('Recovered stuck webhook lease', {
+      deliveryId: doc.deliveryId, url: doc.url, leasedBy: doc.leasedBy,
+    });
+    recovered++;
+  }
+
+  return recovered;
+}
+
+/**
+ * Process pending webhook retries — Issue #74 (atomic claiming).
+ *
+ * Each pending+due retry is claimed atomically with findOneAndUpdate (flipping
+ * status pending → processing) before sending. Only the worker that wins the
+ * claim delivers it, so concurrent replicas never double-deliver. Stuck leases
+ * from crashed workers are recovered before picking up new work.
+ */
 async function processPendingRetries() {
   try {
-    const now = new Date();
-    const pending = await WebhookRetry.find({
-      status: 'pending',
-      nextRetryAt: { $lte: now },
-    }).limit(10);
-
-    for (const retry of pending) {
-      await retryWebhook(retry);
+    // 1. Recover any stuck leases from crashed workers.
+    const stuckRecovered = await recoverStuckLeases();
+    if (stuckRecovered > 0) {
+      logger.info('WEBHOOK_RETRY_STUCK_RECOVERED', { count: stuckRecovered });
     }
 
-    return { processed: pending.length };
+    // 2. Atomically claim and process up to 10 pending retries.
+    const now = new Date();
+    let processed = 0;
+
+    for (let i = 0; i < 10; i++) {
+      const claimed = await WebhookRetry.findOneAndUpdate(
+        { status: 'pending', nextRetryAt: { $lte: now } },
+        { $set: { status: 'processing', leasedAt: new Date(), leasedBy: WORKER_ID } },
+        { new: true, sort: { nextRetryAt: 1 } } // oldest-due first
+      );
+      if (!claimed) break; // no more pending retries
+      await retryWebhook(claimed);
+      processed++;
+    }
+
+    return { processed };
   } catch (err) {
     logger.error('Error processing webhook retries', { error: err.message });
     throw err;
@@ -487,7 +551,7 @@ async function retryWebhook(retry) {
     });
     await WebhookRetry.updateOne(
       { _id: retry._id },
-      { $set: { status: 'failed', lastError: 'Invalid or disallowed webhook URL', lastAttemptAt: new Date() } }
+      { $set: { status: 'failed', lastError: 'Invalid or disallowed webhook URL', lastAttemptAt: new Date(), leasedAt: null, leasedBy: null } }
     );
     return;
   }
@@ -509,7 +573,7 @@ async function retryWebhook(retry) {
   if (result.success) {
     await WebhookRetry.updateOne(
       { _id: retry._id },
-      { $set: { status: 'succeeded', succeededAt: new Date(), lastAttemptAt: new Date() } }
+      { $set: { status: 'succeeded', succeededAt: new Date(), lastAttemptAt: new Date(), leasedAt: null, leasedBy: null } }
     );
     return;
   }
@@ -519,7 +583,7 @@ async function retryWebhook(retry) {
     await WebhookRetry.updateOne(
       { _id: retry._id },
       {
-        $set: { attemptCount: attemptNumber, nextRetryAt, lastError: result.error, lastAttemptAt: new Date() },
+        $set: { status: 'pending', attemptCount: attemptNumber, nextRetryAt, lastError: result.error, lastAttemptAt: new Date(), leasedAt: null, leasedBy: null },
         $push: { errorLog: { attemptNumber, error: result.error, timestamp: new Date() } },
       }
     );
@@ -532,7 +596,7 @@ async function retryWebhook(retry) {
     await WebhookRetry.updateOne(
       { _id: retry._id },
       {
-        $set: { status: 'failed', attemptCount: attemptNumber, lastError: result.error, lastAttemptAt: new Date() },
+        $set: { status: 'failed', attemptCount: attemptNumber, lastError: result.error, lastAttemptAt: new Date(), leasedAt: null, leasedBy: null },
         $push: { errorLog: { attemptNumber, error: result.error, timestamp: new Date() } },
       }
     );
@@ -733,6 +797,7 @@ module.exports = {
   queueWebhookRetry,
   processPendingRetries,
   retryWebhook,
+  recoverStuckLeases,
   getBackoffDelay,
   // Internal dispatch helper (exported for testing)
   _dispatchToSchool,
