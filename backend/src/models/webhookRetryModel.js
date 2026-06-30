@@ -11,7 +11,7 @@ const webhookRetrySchema = new mongoose.Schema(
   {
     // Webhook configuration
     url: { type: String, required: true, index: true },
-    event: { type: String, required: true, enum: ['payment.confirmed', 'payment.pending', 'payment.failed', 'payment.suspicious'] },
+    event: { type: String, required: true, enum: ['payment.confirmed', 'payment.pending', 'payment.failed', 'payment.suspicious', 'payment.refunded'] },
     payload: { type: mongoose.Schema.Types.Mixed, required: true },
     secret: { type: String, default: null }, // HMAC secret for re-signing on retry
 
@@ -20,6 +20,12 @@ const webhookRetrySchema = new mongoose.Schema(
 
     // Correlation ID for tracing this delivery back to its originating payment.
     correlationId: { type: String, default: null, index: true },
+
+    // #865: back-reference to the WebhookEndpoint (null for legacy deliveries)
+    endpointId: { type: mongoose.Schema.Types.ObjectId, ref: 'WebhookEndpoint', default: null, index: true },
+
+    // #865: denormalised schoolId for metrics and dead-letter queries
+    schoolId: { type: String, default: null, index: true },
 
     // Retry tracking
     status: {

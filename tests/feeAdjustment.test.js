@@ -15,9 +15,7 @@ const { DynamicFeeAdjustmentEngine, feeEngine } = require('../backend/src/servic
 
 // Mock FeeAdjustmentRule model
 jest.mock('../backend/src/models/feeAdjustmentRuleModel', () => ({
-  find: jest.fn().mockReturnValue({
-    sort: jest.fn().mockResolvedValue([]),
-  }),
+  find: jest.fn().mockResolvedValue([]),
 }));
 
 const FeeAdjustmentRule = require('../backend/src/models/feeAdjustmentRuleModel');
@@ -26,16 +24,12 @@ describe('FeeAdjustmentService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     // Reset mock to return empty array by default
-    FeeAdjustmentRule.find.mockReturnValue({
-      sort: jest.fn().mockResolvedValue([]),
-    });
+    FeeAdjustmentRule.find.mockResolvedValue([]);
   });
 
   describe('calculateAdjustedFee', () => {
     it('should return base fee when no rules apply', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([]),
-      });
+      FeeAdjustmentRule.find.mockResolvedValue([]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -48,8 +42,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply percentage discount', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Early Payment',
             type: 'discount_percentage',
@@ -58,8 +51,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -73,8 +65,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply fixed discount', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Flat Discount',
             type: 'discount_fixed',
@@ -83,8 +74,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -96,8 +86,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply percentage penalty', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Late Payment',
             type: 'penalty_percentage',
@@ -106,8 +95,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -119,8 +107,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply fixed penalty', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Processing Fee',
             type: 'penalty_fixed',
@@ -129,8 +116,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -142,8 +128,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply waiver (full discount)', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Full Waiver',
             type: 'waiver',
@@ -152,8 +137,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -165,8 +149,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should apply multiple rules in priority order', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Early Payment',
             type: 'discount_percentage',
@@ -183,8 +166,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -198,8 +180,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should clamp negative fees to zero', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Large Discount',
             type: 'discount_percentage',
@@ -208,8 +189,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -220,8 +200,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should respect rule conditions - student class', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Grade 5 Discount',
             type: 'discount_percentage',
@@ -230,8 +209,7 @@ describe('FeeAdjustmentService', () => {
             conditions: { studentClass: ['Grade 5A', 'Grade 5B'] },
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 6A' }, paymentDate: new Date() };
@@ -247,8 +225,7 @@ describe('FeeAdjustmentService', () => {
       const futureDate = new Date();
       futureDate.setDate(futureDate.getDate() + 10);
 
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Early Payment',
             type: 'discount_percentage',
@@ -257,8 +234,7 @@ describe('FeeAdjustmentService', () => {
             conditions: { paymentBefore: futureDate.toISOString() },
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 250 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -270,8 +246,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should handle zero base fee', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Discount',
             type: 'discount_percentage',
@@ -280,8 +255,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 0 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };
@@ -292,8 +266,7 @@ describe('FeeAdjustmentService', () => {
     });
 
     it('should round to 2 decimal places', async () => {
-      FeeAdjustmentRule.find.mockReturnValue({
-        sort: jest.fn().mockResolvedValue([
+      FeeAdjustmentRule.find.mockResolvedValue([
           {
             name: 'Discount',
             type: 'discount_percentage',
@@ -302,8 +275,7 @@ describe('FeeAdjustmentService', () => {
             conditions: {},
             isActive: true,
           },
-        ]),
-      });
+        ]);
 
       const feeStructure = { feeAmount: 100 };
       const context = { student: { className: 'Grade 5A' }, paymentDate: new Date() };

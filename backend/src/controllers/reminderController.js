@@ -43,10 +43,11 @@ async function previewReminders(req, res, next) {
     const { schoolId } = req; // injected by resolveSchool middleware
 
     const query = {
-      feePaid:        false,
-      parentEmail:    { $ne: null, $exists: true },
-      reminderOptOut: { $ne: true },
-      reminderCount:  { $lt: REMINDER_MAX_COUNT },
+      feePaid:             false,
+      parentEmail:         { $ne: null, $exists: true },
+      reminderOptOut:      { $ne: true },
+      parentEmailSuppressed: { $ne: true },
+      reminderCount:       { $lt: REMINDER_MAX_COUNT },
     };
 
     if (schoolId) query.schoolId = schoolId;

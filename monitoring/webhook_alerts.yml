@@ -1,0 +1,46 @@
+groups:
+  - name: webhook_alerts
+    rules:
+      # Alert when more than 20% of webhook deliveries are failing over a 5-minute window
+      - alert: WebhookHighFailureRate
+        expr: |
+          (
+            rate(webhook_deliveries_total{outcome="failure"}[5m])
+            /
+            rate(webhook_deliveries_total[5m])
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High webhook delivery failure rate"
+          description: >
+            More than 20% of webhook deliveries are failing (current rate:
+            {{ printf "%.1f" (mul 100 $value) }}%).
+            Check dead-letter queue and endpoint health.
+
+      # Alert when dead-letter count exceeds 50 for any school
+      - alert: WebhookDeadLetterGrowing
+        expr: webhook_dead_letter_total > 50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Webhook dead-letter queue growing for school {{ $labels.schoolId }}"
+          description: >
+            School {{ $labels.schoolId }} has {{ $value }} webhook deliveries in the
+            dead-letter queue. Investigate endpoint health and replay failed deliveries
+            via POST /api/webhook-deliveries/:id/replay or the admin DLQ endpoint.
+
+      # Alert when webhook delivery latency p95 exceeds 5 seconds
+      - alert: WebhookHighLatency
+        expr: |
+          histogram_quantile(0.95, rate(webhook_delivery_duration_ms_bucket[5m])) > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook delivery p95 latency is high"
+          description: >
+            The 95th-percentile webhook delivery time has exceeded 5 seconds.
+            Deliveries approaching the 10 s timeout may be failing silently.

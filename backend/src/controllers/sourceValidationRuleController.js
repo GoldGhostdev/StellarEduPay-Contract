@@ -1,5 +1,20 @@
 'use strict';
 
+/**
+ * Source Validation Rule Controller
+ *
+ * All CRUD operations are strictly tenant-scoped: every query includes
+ * `schoolId` derived from `req.schoolId` (populated by the `resolveSchool`
+ * middleware).  Cross-tenant access is structurally impossible — a request
+ * carrying School A's context cannot read or mutate School B's rules.
+ *
+ * Unmatched-sender behaviour
+ * --------------------------
+ * When a payment arrives from a sender address that matches no active rule for
+ * this school the system defaults to ALLOW.  See sourceValidationRuleModel.js
+ * for the full rationale and how to configure a deny-by-default posture.
+ */
+
 const SourceValidationRule = require('../models/sourceValidationRuleModel');
 
 // POST /api/source-rules
@@ -34,12 +49,14 @@ async function createRule(req, res, next) {
       }
     }
 
-    const existing = await SourceValidationRule.findOne({ name });
+    // Duplicate check is scoped to this school only
+    const existing = await SourceValidationRule.findOne({ schoolId: req.schoolId, name });
     if (existing) {
       return res.status(409).json({ error: `A rule named "${name}" already exists.`, code: 'DUPLICATE_RULE' });
     }
 
     const rule = await SourceValidationRule.create({
+      schoolId: req.schoolId,
       name,
       type,
       value: value || null,
@@ -51,6 +68,12 @@ async function createRule(req, res, next) {
 
     res.status(201).json(rule);
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({
+        error: `A rule with that name already exists for this school.`,
+        code: 'DUPLICATE_RULE',
+      });
+    }
     next(err);
   }
 }
@@ -58,7 +81,8 @@ async function createRule(req, res, next) {
 // GET /api/source-rules
 async function getRules(req, res, next) {
   try {
-    const filter = {};
+    // Always scope by schoolId — tenant isolation
+    const filter = { schoolId: req.schoolId };
     if (req.query.type) filter.type = req.query.type;
     if (req.query.isActive !== undefined) filter.isActive = req.query.isActive === 'true';
 
@@ -72,7 +96,11 @@ async function getRules(req, res, next) {
 // DELETE /api/source-rules/:id
 async function deleteRule(req, res, next) {
   try {
-    const rule = await SourceValidationRule.findByIdAndDelete(req.params.id);
+    // Include schoolId so a school cannot delete another school's rule
+    const rule = await SourceValidationRule.findOneAndDelete({
+      _id: req.params.id,
+      schoolId: req.schoolId,
+    });
     if (!rule) {
       return res.status(404).json({ error: 'Rule not found.', code: 'NOT_FOUND' });
     }

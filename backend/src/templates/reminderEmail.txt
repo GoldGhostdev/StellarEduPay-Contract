@@ -1,16 +1,17 @@
-Dear Parent/Guardian,
+{{i18n_greeting}}
 
-This is a reminder that school fees for {{studentName}} (ID: {{studentId}}, Class: {{className}}) are outstanding.
+{{i18n_feeReminder}} {{studentName}} (ID: {{studentId}}, Class: {{className}})
 
-  School       : {{schoolName}}
-  Fee Amount   : {{feeAmount}}
-  Amount Due   : {{outstanding}}
-
-Please arrange payment at your earliest convenience to avoid any disruption to your child's education.
+  {{i18n_school}}    : {{schoolName}}
+  {{i18n_feeAmount}} : {{feeAmount}}
+  {{i18n_amountDue}} : {{outstanding}}
+{{#if supportContact}}  Support        : {{supportContact}}
+{{/if}}
+{{i18n_payPrompt}}
 
 {{#if reminderNote}}{{reminderNote}}
 
-{{/if}}Thank you,
-{{schoolName}} Administration
+{{/if}}{{i18n_thanks}}
+{{schoolName}} {{i18n_administration}}
 
-{{#if unsubscribeUrl}}To stop receiving these reminders: {{unsubscribeUrl}}{{/if}}
+{{#if unsubscribeUrl}}{{i18n_unsubscribeText}} {{unsubscribeUrl}}{{/if}}

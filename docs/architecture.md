@@ -330,7 +330,7 @@ School
 
 ## Background Workers
 
-All workers start on server boot inside the `mongoose.connect().then(...)` callback in `app.js` and shut down gracefully on `SIGTERM`/`SIGINT`.
+All workers start on server boot inside the `connectDatabase().then(...)` callback in `app.js` and shut down gracefully on `SIGTERM`/`SIGINT`.
 
 | Worker | Start function | Interval | Purpose |
 |---|---|---|---|
@@ -399,3 +399,38 @@ contentSecurityPolicy: {
 ```
 
 This follows the principle of least privilege: the backend declares that no browser should ever render its responses as a document.
+
+---
+
+## MongoDB Connection Configuration
+
+Connection options are explicitly configured in `backend/src/config/database.js` for production durability and performance:
+
+| Option | Value | Rationale |
+|--------|-------|-----------|
+| `maxPoolSize` | 20 (env: `MONGODB_POOL_SIZE`) | Limits sockets to prevent resource exhaustion under load; matches the `concurrentRequestHandler` queue maxConcurrent. |
+| `minPoolSize` | 10 (env: `DB_MIN_POOL_SIZE`) | Keeps warm sockets ready for traffic bursts. |
+| `maxIdleTimeMS` | 30000 | Reclaims idle connections after 30s to avoid stale connections. |
+| `connectTimeoutMS` | 10000 | Fail fast on unreachable MongoDB. |
+| `socketTimeoutMS` | 45000 | Prevent hung operations; should exceed typical query latency. |
+| `serverSelectionTimeoutMS` | 5000 | Quick detection of replica set availability issues. |
+| `w: 'majority'` | `majority` | Financial writes must be acknowledged by a majority of replica set members to survive failover. |
+| `readPreference` | `primaryPreferred` | Always reads from primary for consistency; falls back to secondaries only if primary is unavailable. |
+| `retryWrites` | `true` | Automatic retry of transient write failures. |
+| `retryReads` | `true` | Automatic retry of transient read failures. |
+
+### Write Concern for Financial Operations
+
+Payment writes use explicit `{ w: 'majority', wtimeout: 5000 }` to ensure:
+- Durability across replica set failover
+- Acknowledgement latency bounded by timeout (prevents indefinite hangs)
+
+This is applied in `transactionService.js` for `Payment.create()` and `Outbox.create()` operations.
+
+### Load Testing Pool Sizing
+
+The `tests/mongoPoolSizing.test.js` validates that the connection pool handles concurrent operations correctly without exhaustion. Run with:
+
+```bash
+npm test -- tests/mongoPoolSizing.test.js
+```

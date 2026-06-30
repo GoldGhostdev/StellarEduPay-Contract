@@ -125,6 +125,26 @@ new client.Gauge({
   },
 });
 
+const stuckPaymentsGauge = new client.Gauge({
+  name: 'stuck_payments',
+  help: 'Number of stuck payments awaiting reconciliation',
+  registers: [registry],
+  async collect() {
+    try {
+      const { STUCK_PAYMENT_THRESHOLD_MS } = require('../services/stuckPaymentReconciliation');
+      const Payment = require('../models/paymentModel');
+      const count = await Payment.countDocuments({
+        status: 'SUBMITTED',
+        submittedAt: { $lt: new Date(Date.now() - STUCK_PAYMENT_THRESHOLD_MS) },
+        deletedAt: null,
+      });
+      this.set(count);
+    } catch (_) {
+      // DB may not be ready yet — scrape still succeeds with stale/zero values
+    }
+  },
+});
+
 // suspicious_payment_flagged{school_id} — counter of payments flagged as
 // suspicious by the abnormal-pattern detector, so operators can alert on
 // flagged volume per tenant. Incremented in the payment confirmation pipeline.
@@ -168,6 +188,45 @@ const httpRequestDurationSeconds = new client.Histogram({
   registers: [registry],
 });
 
+// payment_funnel_total{stage, school_id} — tracks each stage of the payment
+// processing funnel: received (tx seen by poller), validated (passes
+// amount/memo checks), matched (student found), confirmed (saved to DB).
+// CARDINALITY NOTE: school_id label bounded to tenant count; never use studentId or txHash as labels
+const paymentFunnelTotal = new client.Counter({
+  name: 'payment_funnel_total',
+  help: 'Number of payments at each processing stage (received, validated, matched, confirmed)',
+  labelNames: ['stage', 'school_id'],
+  registers: [registry],
+});
+
+// horizon_request_duration_seconds{operation} — latency histogram for outbound
+// calls to the Stellar Horizon API. Operations: loadAccount, payments, transactions.
+const horizonRequestDurationSeconds = new client.Histogram({
+  name: 'horizon_request_duration_seconds',
+  help: 'Duration of Horizon API requests in seconds',
+  labelNames: ['operation'],
+  buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
+  registers: [registry],
+});
+
+// webhook_delivery_total{outcome} — counts webhook delivery attempts by outcome.
+// outcomes: 'success' (HTTP 2xx), 'failure' (error or non-2xx), 'retry' (queued for retry).
+const webhookDeliveryTotal = new client.Counter({
+  name: 'webhook_delivery_total',
+  help: 'Number of webhook delivery attempts grouped by outcome (success, failure, retry)',
+  labelNames: ['outcome'],
+  registers: [registry],
+});
+
+// notification_sent_total{channel} — counts outbound notifications by channel.
+// channels: 'email', 'sms', 'whatsapp'. smsService increments 'sms'/'whatsapp'.
+const notificationSentTotal = new client.Counter({
+  name: 'notification_sent_total',
+  help: 'Number of notifications sent grouped by delivery channel (email, sms, whatsapp)',
+  labelNames: ['channel'],
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   syncDurationSeconds,
@@ -176,4 +235,9 @@ module.exports = {
   paymentBatchTotal,
   paymentBatchItemsTotal,
   paymentBatchDurationSeconds,
+  stuckPaymentsGauge,
+  paymentFunnelTotal,
+  horizonRequestDurationSeconds,
+  webhookDeliveryTotal,
+  notificationSentTotal,
 };

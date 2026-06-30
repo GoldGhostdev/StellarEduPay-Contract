@@ -101,7 +101,9 @@ async function updateFeeStructure(req, res, next) {
       const Payment = require('../models/paymentModel');
       const StudentFeeHistory = require('../models/studentFeeHistoryModel');
 
-      const session = await mongoose.connection.startSession();
+      const session = await mongoose.connection.startSession({
+        causalConsistency: true,
+      });
       try {
         await session.withTransaction(async () => {
           const students = await Student.find({ schoolId: req.schoolId, class: className, deletedAt: null }).session(session);
@@ -135,7 +137,7 @@ async function updateFeeStructure(req, res, next) {
               };
             });
 
-            await Student.bulkWrite(bulkOps, { session });
+            await Student.bulkWrite(bulkOps, { session, writeConcern: { w: 'majority' } });
 
             const historyDocs = students.map(s => {
               const amountPaid = paidByStudentId.get(s.studentId) || 0;
@@ -151,7 +153,7 @@ async function updateFeeStructure(req, res, next) {
               };
             });
 
-            await StudentFeeHistory.insertMany(historyDocs, { session });
+            await StudentFeeHistory.insertMany(historyDocs, { session, writeConcern: { w: 'majority' } });
             studentsUpdated = students.length;
           }
         });

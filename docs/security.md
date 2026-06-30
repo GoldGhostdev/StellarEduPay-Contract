@@ -92,3 +92,46 @@ npm test -- tests/csp.test.js
 If a new external service needs to be reachable from the frontend (e.g. a currency conversion API), add its origin to the `connect-src` directive in `frontend/next.config.js` and update the test in `tests/csp.test.js` accordingly.
 
 Do **not** add `'unsafe-inline'` or `'unsafe-eval'` to `script-src`. If a third-party library requires inline scripts, use a nonce-based approach instead.
+
+---
+
+## SSRF Mitigations (Webhook Delivery)
+
+All outbound webhook URLs pass through a multi-layer SSRF defence on every delivery attempt.
+
+### Registration-time validation
+
+`validateWebhookUrl(url)` is called when an endpoint is created or updated:
+
+- Only `https://` scheme is accepted.
+- Well-known internal hostnames (`localhost`, `*.local`, `*.internal`, `*.localhost`, `*.test`, `*.invalid`) are rejected without a DNS lookup.
+- Bare IP literals are checked directly against the deny list.
+- DNS is resolved and **all** returned addresses (A + AAAA) must be public.
+
+### Send-time re-validation (DNS-rebinding defence)
+
+Immediately before every HTTP delivery the hostname is re-resolved and every IP is re-checked. If the hostname now resolves to a private address (DNS rebinding attack), the delivery is aborted with error `SSRF_BLOCKED`.
+
+### IP deny list
+
+Both IPv4 and IPv6 are covered:
+
+| Range | Reason |
+|-------|--------|
+| 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 | RFC 1918 private |
+| 127.0.0.0/8 | Loopback |
+| 169.254.0.0/16 | Link-local / AWS metadata |
+| 100.64.0.0/10 | CGNAT (RFC 6598) |
+| ::1 | IPv6 loopback |
+| fe80::/10 | IPv6 link-local |
+| fc00::/7 | IPv6 ULA |
+| ::ffff:0:0/96 | IPv4-mapped (delegates to IPv4 check) |
+| 64:ff9b::/96 | NAT64 prefix |
+
+### Redirect blocking
+
+The Axios instance used for delivery is configured with `maxRedirects: 0`. Any 3xx response is treated as a delivery failure with error code `SSRF_REDIRECT_BLOCKED` and is not followed.
+
+### Response size cap
+
+Response bodies are capped at 64 KB (`maxContentLength: 65536`). Requests that exceed this are aborted.

@@ -2,6 +2,7 @@
 
 const mongoose = require('mongoose');
 const StellarSdk = require('@stellar/stellar-sdk');
+const { encryptWebhookSecret, decryptWebhookSecret } = require('../services/webhookSecretEncryption');
 
 /**
  * School model — each school is a fully independent tenant.
@@ -29,6 +30,15 @@ const schoolSchema = new mongoose.Schema(
     },
     network:        { type: String, enum: ['testnet', 'mainnet'], default: 'testnet' },
     isActive:       { type: Boolean, default: true, index: true },
+    /**
+     * Horizon paging cursor for the transaction poller (#839).
+     * Holds the `paging_token` of the most recently examined transaction for
+     * this school's wallet. The poller resumes ascending paging from this value
+     * each cycle, so it never re-scans history from genesis and never skips a
+     * transaction (gap-free, resumable). Null/unset = start from the oldest
+     * transaction on first run.
+     */
+    syncCursor:     { type: String, default: null },
     adminEmail:     { type: String, default: null },
     address:        { type: String, default: null },
     /**
@@ -82,6 +92,43 @@ const schoolSchema = new mongoose.Schema(
      * Generate with: crypto.randomBytes(32).toString('hex')
      */
     webhookSecret:  { type: String, default: null },
+    /**
+     * Per-school webhook payload field controls.
+     * Determines which fields are included in outbound webhook payloads.
+     *
+     * allowedFields: whitelist of field names sent in every delivery.
+     *   Defaults to the safe minimal set (no PII: studentId and senderAddress
+     *   are excluded unless explicitly opted in).
+     *   See utils/buildWebhookPayload.js for the full field enum and defaults.
+     */
+    webhookPayloadConfig: {
+      allowedFields: {
+        type: [String],
+        default: () => [
+          'event',
+          'txHash',
+          'transactionHash',
+          'amount',
+          'asset',
+          'assetCode',
+          'status',
+          'schoolId',
+          'ts',
+          'timestamp',
+          'correlationId',
+          'referenceCode',
+          'finalFee',
+          'feeValidationStatus',
+          'confirmedAt',
+          'ledgerSequence',
+          'reason',
+          'isSuspicious',
+          'originalTxHash',
+          'refundTxHash',
+          'refundedAt',
+        ],
+      },
+    },
     /**
      * Multiplier threshold for flagging suspicious payments.
      * Payments deviating from expected fee by more than this multiplier are flagged.
@@ -141,6 +188,23 @@ const schoolSchema = new mongoose.Schema(
       min: [1, 'maxStudents must be at least 1'],
     },
     /**
+     * Per-school email branding and localization fields.
+     *
+     * logoUrl        — URL to the school logo image, embedded in reminder emails.
+     * supportContact — Phone number or email for the school's support/admin contact.
+     * primaryColor   — Hex color for the email header background (e.g. '#1a56db').
+     * emailLocale    — BCP-47-style locale code for email template language.
+     *                  Supported: 'en', 'fr', 'es', 'pt', 'tpi' (Tok Pisin), 'ha' (Hausa).
+     */
+    logoUrl: { type: String, default: null },
+    supportContact: { type: String, default: null },
+    primaryColor: { type: String, default: '#1a56db' },
+    emailLocale: {
+      type: String,
+      default: 'en',
+      enum: ['en', 'fr', 'es', 'pt', 'tpi', 'ha'],
+    },
+    /**
      * MFA (TOTP) protection for school admin operations.
      * mfaSecret is AES-256-GCM encrypted; key is derived from JWT_SECRET.
      * mfaBackupCodes holds SHA-256 hashes — each code is single-use.
@@ -190,6 +254,25 @@ schoolSchema.set('toJSON', {
     delete ret.mfaBackupCodes;
     return ret;
   },
+});
+
+// ── Webhook secret encryption — Issue #75 ────────────────────────────────────
+// Encrypt webhookSecret at rest before persisting; decrypt transparently on load.
+// Both operations are no-ops when WEBHOOK_SECRET_ENCRYPTION_KEY is not set,
+// so local development without the key continues to work.
+
+schoolSchema.pre('save', function (next) {
+  if (this.isModified('webhookSecret') && this.webhookSecret != null) {
+    this.webhookSecret = encryptWebhookSecret(this.webhookSecret);
+  }
+  next();
+});
+
+// Decrypt after loading from DB so callers always receive plaintext.
+schoolSchema.post('init', function () {
+  if (this.webhookSecret != null) {
+    this.webhookSecret = decryptWebhookSecret(this.webhookSecret);
+  }
 });
 
 module.exports = mongoose.model('School', schoolSchema);

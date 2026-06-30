@@ -219,7 +219,7 @@ function clearLoginFailures(loginId) {
   del(fk, lk);
   const redis = getRedisClient();
   if (redis && isRedisReady()) {
-    redis.del(fk, lk).catch(() => {});
+    redis.del(fk, lk).catch(() => logger.debug('[AuthController] clearLoginFailures redis del missed'));
   }
 }
 
@@ -330,7 +330,7 @@ async function handleLogin(req, res) {
     }
 
     if (!credValid) {
-      recordLoginFailure(loginId).catch(() => {});
+      recordLoginFailure(loginId).catch(() => logger.debug('[AuthController] recordLoginFailure missed (invalid credentials)'));
       return res.status(401).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
     }
 
@@ -372,13 +372,13 @@ async function handleLogin(req, res) {
 
   if (!user) {
     await bcrypt.compare(password || '', '$2a$10$dummyhashtopreventtimingattacks000000000000000000000000');
-    recordLoginFailure(loginId).catch(() => {});
+    recordLoginFailure(loginId).catch(() => logger.debug('[AuthController] recordLoginFailure missed (no user)'));
     return res.status(401).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
   }
 
   const credValid = Boolean(password) && await bcrypt.compare(password, user.passwordHash);
   if (!credValid) {
-    recordLoginFailure(loginId).catch(() => {});
+    recordLoginFailure(loginId).catch(() => logger.debug('[AuthController] recordLoginFailure missed (invalid credentials)'));
     return res.status(401).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
   }
 
@@ -394,11 +394,11 @@ async function handleLogin(req, res) {
       if (!totpValid) {
         const bcIdx = verifyBackupCode(user.mfaBackupCodes || [], mfaCode);
         if (bcIdx === -1) {
-          recordLoginFailure(loginId).catch(() => {});
+          recordLoginFailure(loginId).catch(() => logger.debug('[AuthController] recordLoginFailure missed (invalid MFA)'));
           return res.status(401).json({ error: 'Invalid MFA code.', code: 'INVALID_MFA_CODE' });
         }
         const User = require('../models/userModel');
-        User.findByIdAndUpdate(user._id, { $set: { [`mfaBackupCodes.${bcIdx}.used`]: true } }).catch(() => {});
+        User.findByIdAndUpdate(user._id, { $set: { [`mfaBackupCodes.${bcIdx].used`]: true } }).catch(() => logger.debug('[AuthController] mark user backup code used missed'));
       }
     } else if (user.schoolId) {
       const School = require('../models/schoolModel');
@@ -417,14 +417,14 @@ async function handleLogin(req, res) {
         if (!totpValid) {
           const bcIdx = verifyBackupCode(school.mfaBackupCodes, mfaCode);
           if (bcIdx === -1) {
-            recordLoginFailure(loginId).catch(() => {});
+            recordLoginFailure(loginId).catch(() => logger.debug('[AuthController] recordLoginFailure missed (invalid MFA school)'));
             return res.status(401).json({ error: 'Invalid MFA code.', code: 'INVALID_MFA_CODE' });
           }
           school.mfaBackupCodes[bcIdx].used = true;
           School.findOneAndUpdate(
             { schoolId: user.schoolId },
-            { $set: { [`mfaBackupCodes.${bcIdx}.used`]: true } }
-          ).catch(() => {});
+            { $set: { [`mfaBackupCodes.${bcIdx].used`]: true } }
+          ).catch(() => logger.debug('[AuthController] mark school backup code used missed'));
         }
       }
     }
@@ -479,7 +479,7 @@ async function handleRefresh(req, res) {
     if (consumedFamilyId) {
       logger.warn('[AuthController] Refresh token reuse detected — revoking family', { familyId: consumedFamilyId });
       const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
-      await store.revokeFamily(consumedFamilyId, refreshTTL).catch(() => {});
+      await store.revokeFamily(consumedFamilyId, refreshTTL).catch(() => logger.debug('[AuthController] revokeFamily on reuse-detection missed'));
     }
     res.clearCookie(REFRESH_COOKIE, { path: REFRESH_COOKIE_PATH });
     return res.status(401).json({ error: 'Invalid or expired refresh token.', code: 'INVALID_REFRESH_TOKEN' });
@@ -514,7 +514,7 @@ async function handleRefresh(req, res) {
   if (meta.sessionId) {
     store.getSession(meta.sessionId)
       .then(sess => sess && store.setSession(meta.sessionId, { ...sess, lastUsed: new Date().toISOString() }, refreshTTL))
-      .catch(() => {});
+      .catch(() => logger.debug('[AuthController] session lastUsed update missed'));
   }
 
   // Reconstruct JWT payload from stored metadata so the refreshed token is
@@ -546,10 +546,10 @@ async function handleLogout(req, res) {
     if (meta?.familyId) {
       // Revoke the whole family so any rotated copies are also invalidated
       const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
-      await store.revokeFamily(meta.familyId, refreshTTL).catch(() => {});
-      if (meta.sessionId) await store.delSession(meta.sessionId).catch(() => {});
+      await store.revokeFamily(meta.familyId, refreshTTL).catch(() => logger.debug('[AuthController] revokeFamily on logout missed'));
+      if (meta.sessionId) await store.delSession(meta.sessionId).catch(() => logger.debug('[AuthController] delSession on logout missed'));
     }
-    await store.delToken(refreshToken).catch(() => {});
+    await store.delToken(refreshToken).catch(() => logger.debug('[AuthController] delToken on logout missed'));
   }
 
   const cookieBase = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict' };
@@ -592,9 +592,9 @@ async function handleRevokeSession(req, res) {
   }
   if (sess.familyId) {
     const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
-    await store.revokeFamily(sess.familyId, refreshTTL).catch(() => {});
+    await store.revokeFamily(sess.familyId, refreshTTL).catch(() => logger.debug('[AuthController] revokeFamily in handleRevokeSession missed'));
   }
-  await store.delSession(sessionId).catch(() => {});
+  await store.delSession(sessionId).catch(() => logger.debug('[AuthController] delSession in handleRevokeSession missed'));
   return res.json({ message: 'Session revoked.' });
 }
 

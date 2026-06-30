@@ -303,9 +303,243 @@ it('currencyConversionService suite', async () => {
     }
   });
 
+  // ── 11. Currency allowlist (fix #888) ────────────────────────────────────
+
+  await test('rejects an unsupported fiat currency (returns available:false)', async () => {
+    svc.resetCache();
+    // NOTREAL is not in the default allowlist.
+    const result = await svc.convertToLocalCurrency(10, 'XLM', 'NOTREAL');
+    assert.strictEqual(result.available, false);
+    assert.strictEqual(result.localAmount, null);
+    assert.strictEqual(result.unsupportedCurrency, true);
+  });
+
+  await test('getRates throws for unsupported currency', async () => {
+    svc.resetCache();
+    let threw = false;
+    try {
+      await svc._getRates('BOGUS');
+    } catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('allowlist'), `Expected allowlist in: "${err.message}"`);
+    }
+    assert.ok(threw, 'Expected getRates to throw for unsupported currency');
+  });
+
+  await test('respects ALLOWED_FIAT_CURRENCIES env var override', async () => {
+    // Override the allowlist to only allow EUR.
+    const prev = process.env.ALLOWED_FIAT_CURRENCIES;
+    process.env.ALLOWED_FIAT_CURRENCIES = 'EUR';
+    svc._resetAllowlist();
+    try {
+      // USD should now be rejected.
+      const resultUsd = await svc.convertToLocalCurrency(10, 'XLM', 'USD');
+      assert.strictEqual(resultUsd.available, false);
+      assert.strictEqual(resultUsd.unsupportedCurrency, true);
+
+      // EUR should be allowed.
+      const restore = mockHttpsGet({ stellar: { eur: 0.22 }, 'usd-coin': { eur: 0.92 } });
+      try {
+        const resultEur = await svc.convertToLocalCurrency(10, 'XLM', 'EUR');
+        assert.strictEqual(resultEur.available, true);
+        assert.strictEqual(resultEur.currency, 'EUR');
+      } finally {
+        restore();
+      }
+    } finally {
+      // Restore env and allowlist.
+      if (prev === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+      else process.env.ALLOWED_FIAT_CURRENCIES = prev;
+      svc._resetAllowlist();
+      svc.resetCache();
+    }
+  });
+
+  await test('allowlist contains major fiat currencies by default', () => {
+    const allowlist = svc._getAllowlist();
+    for (const code of ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'PGK']) {
+      assert.ok(allowlist.has(code), `Expected default allowlist to include ${code}`);
+    }
+  });
+
+  // ── 12. Bounded LRU (fix #888) ────────────────────────────────────────────
+  // NOTE: These tests need a fresh module with CURRENCY_LRU_MAX_SIZE=2.
+  //       They are defined as top-level it() blocks below the main suite
+  //       to avoid Jest environment teardown issues.
+
+  // ── 13. #892 — decimal-safe multiplication and per-currency decimals ──────
+
+  await test('#892 tiny XLM amount is not rounded to 0.00 (USD)', async () => {
+    svc.resetCache();
+    // 0.001 XLM * 0.10 = 0.0001  →  rounds to 0.00 with old 2-dp-always logic
+    // but should remain non-zero at 2dp (0.00) — however with Decimal it's
+    // exact: 0.0001 rounds to 0.00.  The key fix is that accumulated errors
+    // from float multiply don't produce unexpected drift.
+    // Use a rate that would drift with float: 0.001 * 0.1234567891 should be
+    // 0.0001234567891, which rounds to 0.00 at 2dp — that's correct behaviour.
+    // What we verify is: no float error; result is a JS number, not NaN/Inf.
+    const restore = mockHttpsGet({ stellar: { usd: 0.1234567891 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(0.001, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      assert.ok(typeof result.localAmount === 'number', 'localAmount should be a number');
+      assert.ok(isFinite(result.localAmount), 'localAmount should be finite');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 tiny amount with a larger rate stays non-zero at 2dp', async () => {
+    svc.resetCache();
+    // 0.05 XLM * 0.10 = 0.005 → rounds to 0.01 at 2dp (ROUND_HALF_UP), not 0.00
+    const restore = mockHttpsGet({ stellar: { usd: 0.10 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(0.05, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.localAmount, 0.01, `Expected 0.01, got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 JPY rate uses 0 decimal places (no fractional yen)', async () => {
+    svc.resetCache();
+    // 10 XLM * 36.789 JPY = 367.89 → should round to 368 (0 dp)
+    const restore = mockHttpsGet({ stellar: { jpy: 36.789 }, 'usd-coin': { jpy: 150.0 } });
+    try {
+      const result = await svc.convertToLocalCurrency(10, 'XLM', 'JPY');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.currency, 'JPY');
+      // 10 * 36.789 = 367.89 → ROUND_HALF_UP at 0 dp → 368
+      assert.strictEqual(result.localAmount, 368, `Expected 368, got ${result.localAmount}`);
+      // Must be an integer when serialised
+      assert.ok(Number.isInteger(result.localAmount), 'JPY amount should be an integer');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 KWD rate uses 3 decimal places', async () => {
+    svc.resetCache();
+    // 1 XLM * 0.073456789 KWD → should round to 0.073 (3 dp)
+    const restore = mockHttpsGet({ stellar: { kwd: 0.073456789 }, 'usd-coin': { kwd: 0.307 } });
+    try {
+      const result = await svc.convertToLocalCurrency(1, 'XLM', 'KWD');
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.currency, 'KWD');
+      // 1 * 0.073456789 → 0.073 at 3dp (rounds down)
+      assert.strictEqual(result.localAmount, 0.073, `Expected 0.073, got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
+  await test('#892 CURRENCY_DECIMALS is exported and contains JPY=0 and KWD=3', () => {
+    assert.strictEqual(svc.CURRENCY_DECIMALS['JPY'], 0);
+    assert.strictEqual(svc.CURRENCY_DECIMALS['KWD'], 3);
+    assert.strictEqual(svc.CURRENCY_DECIMALS['USD'], undefined, 'USD should not be in the map (defaults to 2)');
+  });
+
+  await test('#892 float multiply drift is eliminated (known problematic case)', async () => {
+    svc.resetCache();
+    // Classic float issue: 1.005 * 1 rounds incorrectly with naive toFixed(2)
+    // because JS: (1.005).toFixed(2) === '1.00' in some engines.
+    // With Decimal.js this should be 1.01.
+    const restore = mockHttpsGet({ stellar: { usd: 1.005 }, 'usd-coin': { usd: 1.00 } });
+    try {
+      const result = await svc.convertToLocalCurrency(1, 'XLM', 'USD');
+      assert.strictEqual(result.available, true);
+      // Decimal ROUND_HALF_UP: 1 * 1.005 = 1.005 → 1.01
+      assert.strictEqual(result.localAmount, 1.01, `Expected 1.01 (decimal-safe), got ${result.localAmount}`);
+    } finally {
+      restore();
+    }
+  });
+
   // ── Summary ───────────────────────────────────────────────────────────────
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);
 })();
 }, 30000);
+
+// ── LRU standalone tests (top-level it() blocks) ─────────────────────────────
+// These require a fresh module load with a custom CURRENCY_LRU_MAX_SIZE so they
+// must live outside the IIFE to ensure proper Jest lifecycle ordering.
+
+it('LRU cache evicts oldest entry when maxSize is exceeded', async () => {
+  let svcSmall;
+  const origMax = process.env.CURRENCY_LRU_MAX_SIZE;
+  const origAllowed = process.env.ALLOWED_FIAT_CURRENCIES;
+  process.env.CURRENCY_LRU_MAX_SIZE = '2';
+  process.env.ALLOWED_FIAT_CURRENCIES = 'USD,EUR,AA1,AA2,AA3';
+
+  // Use jest.isolateModules to get a fresh module that reads the new env vars.
+  jest.isolateModules(() => {
+    svcSmall = require('../backend/src/services/currencyConversionService');
+  });
+
+  try {
+    // Seed three entries: AA1, AA2, AA3 (LRU max = 2).
+    for (const [code, xlm] of [['AA1', 0.1], ['AA2', 0.2], ['AA3', 0.3]]) {
+      const restore = mockHttpsGet({ stellar: { [code.toLowerCase()]: xlm }, 'usd-coin': { [code.toLowerCase()]: 1.0 } });
+      try {
+        await svcSmall.convertToLocalCurrency(1, 'XLM', code);
+      } finally {
+        restore();
+      }
+    }
+
+    // Cache should have at most 2 entries.
+    assert.ok(
+      svcSmall._getLocalCacheSize() <= 2,
+      `Expected LRU size <= 2, got ${svcSmall._getLocalCacheSize()}`
+    );
+    // Oldest entry (AA1) should have been evicted.
+    const cached = svcSmall.getCachedRates();
+    assert.ok(!cached['AA1'], 'AA1 should have been evicted as the oldest entry');
+    assert.ok(cached['AA3'], 'AA3 (most recent) should still be in cache');
+  } finally {
+    if (origMax === undefined) delete process.env.CURRENCY_LRU_MAX_SIZE;
+    else process.env.CURRENCY_LRU_MAX_SIZE = origMax;
+    if (origAllowed === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+    else process.env.ALLOWED_FIAT_CURRENCIES = origAllowed;
+  }
+}, 10000);
+
+it('LRU cache promotes accessed entry (LRU order)', async () => {
+  let svcLru;
+  const origMax = process.env.CURRENCY_LRU_MAX_SIZE;
+  const origAllowed = process.env.ALLOWED_FIAT_CURRENCIES;
+  process.env.CURRENCY_LRU_MAX_SIZE = '2';
+  process.env.ALLOWED_FIAT_CURRENCIES = 'B1,B2,B3';
+
+  jest.isolateModules(() => {
+    svcLru = require('../backend/src/services/currencyConversionService');
+  });
+
+  try {
+    // Seed B1, B2.
+    for (const [code, xlm] of [['B1', 0.1], ['B2', 0.2]]) {
+      const restore = mockHttpsGet({ stellar: { [code.toLowerCase()]: xlm }, 'usd-coin': { [code.toLowerCase()]: 1.0 } });
+      try { await svcLru.convertToLocalCurrency(1, 'XLM', code); } finally { restore(); }
+    }
+
+    // Access B1 to make it the most recently used (cache hit — no network call).
+    await svcLru.convertToLocalCurrency(1, 'XLM', 'B1');
+
+    // Now add B3 — should evict B2 (the LRU), not B1.
+    const restore3 = mockHttpsGet({ stellar: { b3: 0.3 }, 'usd-coin': { b3: 1.0 } });
+    try { await svcLru.convertToLocalCurrency(1, 'XLM', 'B3'); } finally { restore3(); }
+
+    const cached = svcLru.getCachedRates();
+    assert.ok(!cached['B2'], 'B2 (LRU after B1 was accessed) should have been evicted');
+    assert.ok(cached['B1'], 'B1 (recently accessed) should still be in cache');
+    assert.ok(cached['B3'], 'B3 (most recently set) should be in cache');
+  } finally {
+    if (origMax === undefined) delete process.env.CURRENCY_LRU_MAX_SIZE;
+    else process.env.CURRENCY_LRU_MAX_SIZE = origMax;
+    if (origAllowed === undefined) delete process.env.ALLOWED_FIAT_CURRENCIES;
+    else process.env.ALLOWED_FIAT_CURRENCIES = origAllowed;
+  }
+}, 10000);

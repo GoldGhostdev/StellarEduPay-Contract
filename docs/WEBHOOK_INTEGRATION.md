@@ -157,3 +157,99 @@ Failed deliveries are retried up to **3 times** with exponential backoff:
 | 3rd retry | 15 minutes |
 
 After all retries are exhausted the delivery is moved to the dead-letter queue and is visible to administrators via `GET /api/admin/webhooks/dlq`. An admin can re-trigger a failed delivery with `POST /api/admin/webhooks/dlq/:id/retry`.
+
+---
+
+## Multiple endpoints and per-event subscriptions (#865)
+
+Each school can register **multiple webhook endpoints**, each subscribing to a different set of events.
+
+```
+POST /api/webhook-endpoints
+Authorization: Bearer <school-token>
+X-School-ID: SCH-1
+Content-Type: application/json
+
+{
+  "url": "https://your-server.com/payments",
+  "subscribedEvents": ["payment.confirmed", "payment.failed"],
+  "description": "ERP integration"
+}
+```
+
+Response includes the `secret` (shown **once** at creation — store it securely).
+
+### Manage endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST`   | `/api/webhook-endpoints`        | Create endpoint |
+| `GET`    | `/api/webhook-endpoints`        | List all endpoints for the school |
+| `GET`    | `/api/webhook-endpoints/:id`    | Get single endpoint |
+| `PUT`    | `/api/webhook-endpoints/:id`    | Update url / events / isActive |
+| `DELETE` | `/api/webhook-endpoints/:id`    | Delete endpoint |
+
+**Disabling an endpoint**: set `isActive: false` — it is silently skipped on all deliveries.
+
+### Delivery history and replay
+
+```
+GET  /api/webhook-deliveries?endpointId=<id>&page=1&limit=20
+POST /api/webhook-deliveries/:id/replay
+```
+
+Each delivery attempt is logged with status code, response body (truncated to 1 KB), duration, and error details.
+
+---
+
+## PII field controls (#867)
+
+By default, webhook payloads are **minimal — no PII**. The fields `studentId` and `senderAddress` are excluded unless explicitly opted in.
+
+### Default payload fields
+
+```json
+{
+  "event": "payment.confirmed",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "data": {
+    "txHash": "abc123",
+    "amount": 100,
+    "assetCode": "XLM",
+    "status": "confirmed",
+    "schoolId": "SCH-1",
+    "confirmedAt": "2026-01-01T00:00:00.000Z",
+    "referenceCode": "REF-001"
+  }
+}
+```
+
+### Opt-in to PII fields
+
+Update the school's `webhookPayloadConfig` via `PUT /api/schools/:id`:
+
+```json
+{
+  "webhookPayloadConfig": {
+    "allowedFields": [
+      "event", "txHash", "amount", "assetCode", "status", "schoolId",
+      "confirmedAt", "referenceCode", "studentId", "senderAddress"
+    ]
+  }
+}
+```
+
+**Available fields**: `event`, `txHash`, `transactionHash`, `amount`, `asset`, `assetCode`, `status`, `schoolId`, `ts`, `timestamp`, `correlationId`, `referenceCode`, `finalFee`, `feeValidationStatus`, `confirmedAt`, `ledgerSequence`, `reason`, `isSuspicious`, `originalTxHash`, `refundTxHash`, `refundedAt`, `studentId` *(PII)*, `senderAddress` *(PII)*
+
+---
+
+## SSRF mitigations (#866)
+
+All webhook URLs are validated at **registration time and again at every send**:
+
+- Only `https://` scheme is accepted.
+- Hostnames resolving to RFC 1918, loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), CGNAT (100.64.0.0/10), and metadata ranges are blocked.
+- IPv6 ULA (fc00::/7), IPv4-mapped private addresses (`::ffff:10.x.x.x`), and NAT64 prefixes are blocked.
+- **Redirects are disabled** — a 3xx response from the endpoint is treated as a delivery failure (`SSRF_REDIRECT_BLOCKED`).
+- Response bodies are capped at 64 KB.
+- DNS is re-resolved immediately before each delivery (DNS-rebinding defence).

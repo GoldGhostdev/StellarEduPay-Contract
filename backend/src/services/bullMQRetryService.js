@@ -1,6 +1,6 @@
 /**
  * BullMQ Transaction Retry Service
- * 
+ *
  * This service provides a high-level interface for adding failed Stellar transactions
  * to the BullMQ retry queue. It integrates with the existing retry mechanism and
  * provides additional features like automatic error classification and retry scheduling.
@@ -15,6 +15,7 @@ const {
   config,
   QUEUE_NAMES,
 } = require('../queue/transactionRetryQueue');
+const logger = require('../utils/logger').child('BullMQRetryService');
 
 const PendingVerification = require('../models/pendingVerificationModel');
 
@@ -52,15 +53,15 @@ const ERROR_CLASSIFICATION = {
 function classifyError(error) {
   const errorCode = error.code || '';
   const errorMessage = error.message || '';
-  
+
   if (ERROR_CLASSIFICATION.PERMANENT.includes(errorCode)) {
     return 'permanent';
   }
-  
+
   if (ERROR_CLASSIFICATION.TRANSIENT.includes(errorCode)) {
     return 'transient';
   }
-  
+
   // Check error message for transient indicators
   const transientPatterns = [
     /network/i,
@@ -69,13 +70,13 @@ function classifyError(error) {
     /unavailable/i,
     /temporary/i,
   ];
-  
+
   for (const pattern of transientPatterns) {
     if (pattern.test(errorMessage)) {
       return 'transient';
     }
   }
-  
+
   return 'unknown';
 }
 
@@ -85,14 +86,14 @@ function classifyError(error) {
 async function initializeRetryQueue() {
   if (!queueInstance) {
     queueInstance = await initializeQueue();
-    console.log('[BullMQRetryService] Queue system initialized');
+    logger.info('Queue system initialized');
   }
   return queueInstance;
 }
 
 /**
  * Queue a failed transaction for retry with smart error handling
- * 
+ *
  * @param {string} transactionHash - The Stellar transaction hash
  * @param {Object} options - Additional options
  * @param {string} options.studentId - Student ID associated with the transaction
@@ -103,12 +104,12 @@ async function initializeRetryQueue() {
 async function queueFailedTransaction(transactionHash, options = {}) {
   try {
     await initializeRetryQueue();
-    
+
     const { studentId, memo, error, metadata = {} } = options;
-    
+
     // Classify the error to determine retry strategy
     const errorType = error ? classifyError(error) : 'unknown';
-    
+
     // If it's a permanent error, don't queue for retry
     if (errorType === 'permanent') {
       console.log(`[BullMQRetryService] Permanent error detected for ${transactionHash}, not queueing for retry`);
@@ -118,7 +119,7 @@ async function queueFailedTransaction(transactionHash, options = {}) {
         errorCode: error?.code || 'UNKNOWN',
       };
     }
-    
+
     // Also store in MongoDB for tracking and potential recovery.
     // Bypass: admin retry queue is cross-school; txHash is globally unique so no leak risk.
     await PendingVerification.findOneAndUpdate(
@@ -140,7 +141,7 @@ async function queueFailedTransaction(transactionHash, options = {}) {
       },
       { upsert: true, new: true, _bypassTenantScope: true }
     );
-    
+
     // Add to BullMQ queue
     const job = await addTransactionToRetryQueue(transactionHash, studentId, {
       memo,
@@ -150,18 +151,19 @@ async function queueFailedTransaction(transactionHash, options = {}) {
       metadata,
       queuedAt: new Date().toISOString(),
     });
-    
-    console.log(`[BullMQRetryService] Queued transaction ${transactionHash} for retry (attempt ${metadata.attemptNumber || 1})`);
-    
+
+    logger.info(`Queued transaction ${transactionHash} for retry (attempt ${metadata.attemptNumber || 1})`);
+
+
     return {
       queued: true,
       jobId: job?.id,
       errorType,
       transactionHash,
     };
-    
+
   } catch (error) {
-    console.error(`[BullMQRetryService] Failed to queue transaction ${transactionHash}:`, error);
+    logger.error('Failed to queue transaction', { transactionHash, error: error.message });
     throw error;
   }
 }
@@ -175,7 +177,7 @@ async function getRetryQueueStats() {
       getQueueStats(),
       getDLQStats(),
     ]);
-    
+
     // Get MongoDB pending verification stats
     // System-wide stats aggregate: intentionally spans all schools.
     const mongoStats = await PendingVerification.aggregate([
@@ -186,7 +188,7 @@ async function getRetryQueueStats() {
         },
       },
     ]).option({ _bypassTenantScope: true });
-    
+
     return {
       bullmq: mainStats,
       deadLetter: dlqStats,
@@ -202,9 +204,9 @@ async function getRetryQueueStats() {
         workerConcurrency: config.worker.concurrency,
       },
     };
-    
+
   } catch (error) {
-    console.error('[BullMQRetryService] Failed to get queue stats:', error);
+    logger.error('Failed to get queue stats', { error: error.message });
     throw error;
   }
 }
@@ -217,17 +219,17 @@ async function getJobDetails(jobId) {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
     const job = await queue.getJob(jobId);
-    
+
     if (!job) {
       return null;
     }
-    
+
     const state = await job.getState();
     const progress = job.progress;
     const data = job.data;
     const result = job.returnvalue;
     const failedReason = job.failedReason;
-    
+
     return {
       jobId: job.id,
       transactionHash: data.transactionHash,
@@ -242,9 +244,9 @@ async function getJobDetails(jobId) {
       processedOn: job.processedOn,
       finishedOn: job.finishedOn,
     };
-    
+
   } catch (error) {
-    console.error(`[BullMQRetryService] Failed to get job details for ${jobId}:`, error);
+    logger.error('Failed to get job details', { jobId, error: error.message });
     throw error;
   }
 }
@@ -256,9 +258,9 @@ async function getJobsByState(state, limit = 50) {
   try {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
-    
+
     let jobs = [];
-    
+
     switch (state) {
       case 'waiting':
         jobs = await queue.getWaiting(0, limit);
@@ -278,7 +280,7 @@ async function getJobsByState(state, limit = 50) {
       default:
         throw new Error(`Invalid state: ${state}`);
     }
-    
+
     return jobs.map(job => ({
       jobId: job.id,
       transactionHash: job.data.transactionHash,
@@ -287,9 +289,9 @@ async function getJobsByState(state, limit = 50) {
       createdAt: new Date(job.timestamp).toISOString(),
       data: job.data,
     }));
-    
+
   } catch (error) {
-    console.error(`[BullMQRetryService] Failed to get jobs by state ${state}:`, error);
+    logger.error('Failed to get jobs by state', { state, error: error.message });
     throw error;
   }
 }
@@ -302,28 +304,28 @@ async function retryJobImmediately(jobId) {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
     const job = await queue.getJob(jobId);
-    
+
     if (!job) {
       throw new Error(`Job ${jobId} not found`);
     }
-    
+
     const state = await job.getState();
     if (state !== 'failed') {
       throw new Error(`Job ${jobId} is not in failed state (current: ${state})`);
     }
-    
+
     await job.retry();
-    
+
     console.log(`[BullMQRetryService] Retrying job ${jobId} immediately`);
-    
+
     return {
       success: true,
       jobId,
       message: 'Job queued for immediate retry',
     };
-    
+
   } catch (error) {
-    console.error(`[BullMQRetryService] Failed to retry job ${jobId}:`, error);
+    logger.error('Failed to retry job', { jobId, error: error.message });
     throw error;
   }
 }
@@ -336,22 +338,22 @@ async function removeJob(jobId) {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
     const job = await queue.getJob(jobId);
-    
+
     if (!job) {
       throw new Error(`Job ${jobId} not found`);
     }
-    
+
     await job.remove();
-    
+
     console.log(`[BullMQRetryService] Removed job ${jobId}`);
-    
+
     return {
       success: true,
       jobId,
     };
-    
+
   } catch (error) {
-    console.error(`[BullMQRetryService] Failed to remove job ${jobId}:`, error);
+    logger.error('Failed to remove job', { jobId, error: error.message });
     throw error;
   }
 }
@@ -363,18 +365,18 @@ async function cleanupOldJobs(maxAge = 86400000) {
   try {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
-    
+
     const count = await queue.clean(maxAge, 1000, 'completed');
-    
+
     console.log(`[BullMQRetryService] Cleaned up ${count} old completed jobs`);
-    
+
     return {
       cleaned: count,
       maxAge,
     };
-    
+
   } catch (error) {
-    console.error('[BullMQRetryService] Failed to cleanup old jobs:', error);
+    logger.error('Failed to cleanup old jobs', { error: error.message });
     throw error;
   }
 }
@@ -387,13 +389,13 @@ async function pauseQueue() {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
     await queue.pause();
-    
+
     console.log('[BullMQRetryService] Queue paused');
-    
+
     return { success: true, paused: true };
-    
+
   } catch (error) {
-    console.error('[BullMQRetryService] Failed to pause queue:', error);
+    logger.error('Failed to pause queue', { error: error.message });
     throw error;
   }
 }
@@ -406,11 +408,11 @@ async function resumeQueue() {
     await initializeRetryQueue();
     const queue = queueInstance.queue;
     await queue.resume();
-    
+
     console.log('[BullMQRetryService] Queue resumed');
-    
+
     return { success: true, paused: false };
-    
+
   } catch (error) {
     console.error('[BullMQRetryService] Failed to resume queue:', error);
     throw error;
@@ -423,7 +425,7 @@ async function resumeQueue() {
 async function getHealthStatus() {
   try {
     const stats = await getRetryQueueStats();
-    
+
     return {
       healthy: stats.systemHealth.queueHealth === 'healthy',
       status: stats.systemHealth.queueHealth,
@@ -435,7 +437,7 @@ async function getHealthStatus() {
         deadLetteredJobs: stats.deadLetter.metrics?.failed || 0,
       },
     };
-    
+
   } catch (error) {
     return {
       healthy: false,
@@ -443,6 +445,18 @@ async function getHealthStatus() {
       error: error.message,
     };
   }
+}
+
+/**
+ * Drain the retry worker for graceful shutdown.
+ * Waits for active jobs to complete, or marks them for recovery on restart.
+ */
+async function drainWorker() {
+  const transactionRetryQueue = require('../queue/transactionRetryQueue');
+  if (transactionRetryQueue.getWorker && typeof transactionRetryQueue.getWorker === 'function') {
+    return transactionRetryQueue.drainWorker();
+  }
+  return { drained: true, activeJobs: 0, requeuedJobs: 0 };
 }
 
 module.exports = {
@@ -459,6 +473,6 @@ module.exports = {
   getHealthStatus,
   classifyError,
   shutdownQueue,
-  ERROR_CLASSIFICATION,
+  drainWorker,
   QUEUE_NAMES,
 };

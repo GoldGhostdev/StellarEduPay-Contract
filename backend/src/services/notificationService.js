@@ -21,6 +21,7 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const config = require('../config');
 const logger = require('../utils/logger').child('NotificationService');
+const { createEmailDelivery, updateEmailDeliveryStatus } = require('./emailDeliveryService');
 const { generateUnsubscribeToken } = require('../utils/unsubscribeToken');
 
 const TEMPLATES_DIR = path.join(__dirname, '..', 'templates');
@@ -125,6 +126,17 @@ async function sendFeeReminder(opts) {
   const { subject, text, html } = buildReminderEmail({ ...opts, unsubscribeUrl });
   const transporter = getTransporter();
 
+  const deliveryRecord = await createEmailDelivery({
+    schoolId: opts.schoolId,
+    studentId: opts.studentId,
+    type: 'reminder',
+    provider: 'smtp',
+    status: 'queued',
+    providerMessageId: null,
+    sentAt: null,
+    payload: { to: opts.to, subject, studentName: opts.studentName },
+  });
+
   if (!transporter) {
     // Dev/no-SMTP fallback — log the reminder so it's not silently dropped
     logger.info('REMINDER (no SMTP)', {
@@ -132,7 +144,9 @@ async function sendFeeReminder(opts) {
       subject,
       studentId: opts.studentId,
       reminderCount: opts.reminderCount,
+      deliveryId: deliveryRecord._id,
     });
+    await updateEmailDeliveryStatus({ recordId: deliveryRecord._id }, 'skipped', { reason: 'SMTP not configured' });
     return { sent: false, preview: text };
   }
 
@@ -151,6 +165,7 @@ async function sendFeeReminder(opts) {
     reminderCount: opts.reminderCount,
   });
 
+  await updateEmailDeliveryStatus({ recordId: deliveryRecord._id, provider: 'smtp', providerMessageId: info.messageId }, 'sent', { providerMessageId: info.messageId, sentAt: new Date() });
   return { sent: true, messageId: info.messageId };
 }
 

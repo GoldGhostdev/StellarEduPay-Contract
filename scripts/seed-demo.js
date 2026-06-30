@@ -44,8 +44,28 @@ const STUDENTS = [
 
 function daysAgo(n) { return new Date(Date.now() - n * 86400000); }
 
+const POOL_CONFIG = {
+  maxPoolSize: parseInt(process.env.MONGODB_POOL_SIZE || process.env.DB_MAX_POOL_SIZE || '20', 10),
+  minPoolSize: parseInt(process.env.DB_MIN_POOL_SIZE || '10', 10),
+  maxIdleTimeMS: parseInt(process.env.DB_MAX_IDLE_TIME_MS || '30000', 10),
+  connectTimeoutMS: parseInt(process.env.DB_CONNECT_TIMEOUT_MS || '10000', 10),
+  socketTimeoutMS: parseInt(process.env.DB_SOCKET_TIMEOUT_MS || '45000', 10),
+  serverSelectionTimeoutMS: parseInt(process.env.DB_SERVER_SELECTION_TIMEOUT_MS || '5000', 10),
+};
+
 async function main() {
-  await mongoose.connect(process.env.MONGO_URI);
+  await mongoose.connect(process.env.MONGO_URI, {
+    maxPoolSize: POOL_CONFIG.maxPoolSize,
+    minPoolSize: POOL_CONFIG.minPoolSize,
+    maxIdleTimeMS: POOL_CONFIG.maxIdleTimeMS,
+    connectTimeoutMS: POOL_CONFIG.connectTimeoutMS,
+    socketTimeoutMS: POOL_CONFIG.socketTimeoutMS,
+    serverSelectionTimeoutMS: POOL_CONFIG.serverSelectionTimeoutMS,
+    retryWrites: true,
+    retryReads: true,
+    w: 'majority',
+    readPreference: 'primaryPreferred',
+  });
   console.log('connected to', process.env.MONGO_URI.replace(/:\/\/[^@]*@/, '://***@'));
 
   // 1. School

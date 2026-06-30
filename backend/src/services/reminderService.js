@@ -67,8 +67,9 @@ function isBusinessHours(timezone = 'UTC') {
  */
 function isEligible(student) {
   if (student.feePaid)          return false;
-  if (!student.parentEmail)     return false;
-  if (student.reminderOptOut)   return false;
+  if (!student.parentEmail)           return false;
+  if (student.reminderOptOut)         return false;
+  if (student.parentEmailSuppressed)  return false;
   if (student.reminderCount >= REMINDER_MAX_COUNT) return false;
 
   if (student.lastReminderSentAt) {

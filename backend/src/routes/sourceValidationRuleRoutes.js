@@ -5,11 +5,22 @@ const router = express.Router();
 
 const { createRule, getRules, deleteRule } = require('../controllers/sourceValidationRuleController');
 const { requireAdminAuth } = require('../middleware/auth');
+const { resolveSchool } = require('../middleware/schoolContext');
 
-// All source-rule endpoints are admin-only — no school context needed
-// (rules are global payment source controls, not per-school)
-router.post('/',     requireAdminAuth, createRule);
-router.get('/',      requireAdminAuth, getRules);
+/**
+ * Source validation rules are tenant-scoped per school.
+ * All routes require:
+ *   1. resolveSchool — populates req.schoolId from the X-School-ID header
+ *                      (or JWT claim).  Returns 400 if missing.
+ *   2. requireAdminAuth — only school admins may manage source rules.
+ *
+ * Unmatched-sender default: ALLOW.
+ * See sourceValidationRuleModel.js for full semantics.
+ */
+router.use(resolveSchool);
+
+router.post('/',      requireAdminAuth, createRule);
+router.get('/',       requireAdminAuth, getRules);
 router.delete('/:id', requireAdminAuth, deleteRule);
 
 module.exports = router;

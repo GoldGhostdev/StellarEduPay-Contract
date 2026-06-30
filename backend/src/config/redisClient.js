@@ -143,7 +143,7 @@ function isRedisReady() {
 function resetRedisClient() {
   if (client) {
     try {
-      client.quit().catch(() => {});
+      client.quit().catch(() => logger.debug('[RedisClient] quit missed during reset'));
     } catch (_) {}
   }
   client = null;

@@ -27,7 +27,7 @@ export function useAdminAuth() {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-    }).catch(() => {});
+    }).catch(() => console.debug('[useAdminAuth] logout request failed'));
     setIsAdmin(false);
     router.push('/login');
   }, [router]);

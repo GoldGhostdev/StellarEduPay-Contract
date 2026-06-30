@@ -140,7 +140,9 @@ async function connectWithRetry(uri, options = {}, retryCount = 0) {
       // Retry configuration
       retryWrites: true,
       retryReads: true,
+      // Write concern for financial data durability — ensures writes survive replica set failover
       w: 'majority',
+      readPreference: 'primaryPreferred',
     });
     connectionState.isConnecting = false;
     return mongoose.connection;
@@ -244,7 +246,9 @@ async function connectWithStartupRetry(uri, options = {}, retryCount = 0) {
       // Retry configuration
       retryWrites: true,
       retryReads: true,
+      // Write concern for financial data durability — ensures writes survive replica set failover
       w: 'majority',
+      readPreference: 'primaryPreferred',
     });
     connectionState.isConnecting = false;
     logger.info('[MongoDB] Connected successfully on startup', {

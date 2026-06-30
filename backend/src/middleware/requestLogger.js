@@ -20,6 +20,7 @@
 
 const { logger } = require('../utils/logger');
 const { httpRequestDurationSeconds } = require('../metrics');
+const { generateCorrelationId } = require('../utils/correlationId');
 
 const DEFAULT_REDACT_FIELDS = ['txHash', 'studentId', 'memo', 'senderAddress'];
 
@@ -70,10 +71,15 @@ function generateRequestId() {
 function requestLogger() {
   return (req, res, next) => {
     const requestId = generateRequestId();
+    const correlationId = generateCorrelationId();
     const startedAt = Date.now();
 
     // Attach to req so downstream handlers can reference it (e.g. error logs)
     req.requestId = requestId;
+    req.correlationId = correlationId;
+
+    // Propagate correlation ID to the response so callers can trace end-to-end
+    res.setHeader('X-Correlation-ID', correlationId);
 
     const ip =
       (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
@@ -82,6 +88,7 @@ function requestLogger() {
 
     const logData = {
       requestId,
+      correlationId,
       method: req.method,
       url: req.originalUrl,
       ip,
@@ -106,6 +113,7 @@ function requestLogger() {
 
       logger[level]('[Request] completed', {
         requestId,
+        correlationId,
         method: req.method,
         url: req.originalUrl,
         statusCode: res.statusCode,

@@ -8,19 +8,76 @@
  *   - Secondary provider: Coinbase Exchange (/exchange-rates) — used
  *     automatically when CoinGecko fails or returns invalid data.
  *   - Redis-backed shared cache (keyed by `currency:rates:<CURRENCY>`).
- *     Falls back to in-process Map when Redis is unavailable, so each replica
- *     does not independently hammer the price feed.
+ *     Falls back to in-process LRU Map when Redis is unavailable, so each
+ *     replica does not independently hammer the price feed.
  *   - All logging via logger.child('CurrencyConversion') — no console.warn.
  *   - Prometheus gauges: price_feed_available{provider} and
  *     price_feed_staleness_seconds{provider}.
  *   - Stale-while-revalidate: serve stale cache when both providers fail,
  *     up to PRICE_STALE_THRESHOLD_MS (default 1 hour).
+ *
+ * Fix #888:
+ *   - In-process fallback cache is now a bounded LRU (CURRENCY_LRU_MAX_SIZE,
+ *     default 50). Once full, the least-recently-used entry is evicted, so
+ *     memory growth is capped regardless of how many distinct currencies are
+ *     seen.
+ *   - Supported fiat currencies are enforced via an allowlist
+ *     (ALLOWED_FIAT_CURRENCIES env var, comma-separated). Requests for
+ *     currencies outside the allowlist are rejected immediately without
+ *     hitting the price feed or the cache.
+ * Fix #892: decimal-safe multiplication via decimal.js; per-currency decimal
+ *   precision honours ISO 4217 (e.g. JPY = 0 dp, KWD = 3 dp, USD = 2 dp).
  */
 
-const https = require("https");
+const https   = require("https");
+const Decimal = require("decimal.js");
 const client = require("prom-client");
 const { getRedisClient, isRedisReady } = require("../config/redisClient");
 const logger = require("../utils/logger").child("CurrencyConversion");
+
+// ── Per-currency decimal precision (ISO 4217) ─────────────────────────────────
+//
+// Most currencies use 2 decimal places.  Exceptions are listed here so that
+// amounts in zero-decimal currencies (JPY, KRW …) are never shown as "¥1.23"
+// and amounts in 3-decimal currencies (KWD, BHD …) are not under-rounded.
+//
+// Source: ISO 4217 minor unit definitions.
+//
+// CoinGecko response contract (documented here for #893):
+//   GET /api/v3/simple/price?ids=stellar,usd-coin&vs_currencies=<CURRENCY>
+//   {
+//     "stellar":   { "<lc_currency>": <number> },   // XLM rate
+//     "usd-coin":  { "<lc_currency>": <number> }    // USDC rate
+//   }
+//   Both keys MUST be present and their values MUST be positive finite numbers.
+const CURRENCY_DECIMALS = {
+  // 0 decimal places
+  BIF: 0, CLP: 0, DJF: 0, GNF: 0, ISK: 0, JPY: 0, KMF: 0, KRW: 0,
+  MGA: 0, PYG: 0, RWF: 0, UGX: 0, VND: 0, VUV: 0, XAF: 0, XOF: 0, XPF: 0,
+  // 3 decimal places
+  BHD: 3, IQD: 3, JOD: 3, KWD: 3, LYD: 3, OMR: 3, TND: 3,
+  // default is 2 — not listed here
+};
+
+/**
+ * Multiply `amount` by `rate` using decimal-safe arithmetic and round to the
+ * correct number of decimal places for `currency`.
+ *
+ * Returns a plain JS number suitable for JSON serialisation. Uses
+ * ROUND_HALF_UP to match the expectation of most financial displays.
+ *
+ * @param {number|string} amount
+ * @param {number|string} rate
+ * @param {string}        currency  - ISO 4217 code (e.g. "USD", "JPY")
+ * @returns {number}
+ */
+function _decimalMultiply(amount, rate, currency) {
+  const dp = CURRENCY_DECIMALS[currency.toUpperCase()] ?? 2;
+  return new Decimal(amount)
+    .times(new Decimal(rate))
+    .toDecimalPlaces(dp, Decimal.ROUND_HALF_UP)
+    .toNumber();
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -28,9 +85,69 @@ const CACHE_TTL_MS             = parseInt(process.env.PRICE_CACHE_TTL_MS        
 const PRICE_STALE_THRESHOLD_MS = parseInt(process.env.PRICE_STALE_THRESHOLD_MS  || "3600000", 10);
 const COINGECKO_API_KEY        = process.env.COINGECKO_API_KEY || null;
 
+// Supported-currencies list cache (#889):
+//   Periodically refreshed from CoinGecko /simple/supported_vs_currencies.
+//   Falls back to a static allowlist when the network call fails.
+const SUPPORTED_CURRENCIES_TTL_MS =
+  parseInt(process.env.SUPPORTED_CURRENCIES_TTL_MS || "3600000", 10); // 1 hour
+
+// Maximum number of distinct currencies to keep in the in-process LRU cache.
+// When the limit is reached the least-recently-used entry is evicted.
+const CURRENCY_LRU_MAX_SIZE = parseInt(process.env.CURRENCY_LRU_MAX_SIZE || "50", 10);
+
 // Redis cache TTL in seconds (slightly longer than in-memory TTL to allow
 // cross-replica stale-while-revalidate).
 const REDIS_CACHE_TTL_S = Math.ceil(PRICE_STALE_THRESHOLD_MS / 1000);
+
+// ── Currency allowlist ────────────────────────────────────────────────────────
+//
+// ALLOWED_FIAT_CURRENCIES can be set as a comma-separated env var to restrict
+// which target currencies the service will accept.  When the env var is absent
+// the service defaults to a curated set of widely-supported fiat currencies.
+//
+// Keeping an explicit allowlist serves two purposes:
+//   1. Prevents cache pollution from arbitrary/typo currency codes.
+//   2. Avoids CoinGecko/Coinbase calls that are guaranteed to fail for
+//      unsupported or non-existent currency identifiers.
+
+const _DEFAULT_ALLOWED_FIAT = new Set([
+  "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "HKD", "NZD",
+  "SEK", "KRW", "SGD", "NOK", "MXN", "INR", "RUB", "ZAR", "BRL", "TRY",
+  "TWD", "DKK", "PLN", "THB", "IDR", "HUF", "CZK", "ILS", "CLP", "PHP",
+  "AED", "COP", "SAR", "MYR", "RON", "PGK", "NGN", "GHS", "KES", "UGX",
+  "TZS", "ETB", "RWF", "XOF", "XAF", "MAD", "EGP", "PKR", "BDT", "VND",
+]);
+
+/**
+ * Build the runtime allowlist from the ALLOWED_FIAT_CURRENCIES env var or
+ * fall back to _DEFAULT_ALLOWED_FIAT.  Returns a Set<string> of uppercase
+ * currency codes.
+ */
+function _buildAllowlist() {
+  const raw = process.env.ALLOWED_FIAT_CURRENCIES;
+  if (!raw || !raw.trim()) return _DEFAULT_ALLOWED_FIAT;
+  const codes = raw
+    .split(",")
+    .map((c) => c.trim().toUpperCase())
+    .filter(Boolean);
+  if (codes.length === 0) return _DEFAULT_ALLOWED_FIAT;
+  return new Set(codes);
+}
+
+// Evaluated once at module load; tests may call _resetAllowlist() to rebuild
+// after changing the env var.
+let ALLOWED_FIAT_CURRENCIES = _buildAllowlist();
+
+function _resetAllowlist() {
+  ALLOWED_FIAT_CURRENCIES = _buildAllowlist();
+}
+
+/**
+ * Returns true when `currency` (already uppercased) is in the allowlist.
+ */
+function _isCurrencyAllowed(currency) {
+  return ALLOWED_FIAT_CURRENCIES.has(currency);
+}
 
 // ── Prometheus metrics ───────────────────────────────────────────────────────
 
@@ -98,34 +215,146 @@ function _recordStaleness(provider, lastSuccessfulFetchMs) {
   }
 }
 
-/**
- * Record the Unix timestamp of a successful fetch and clear the stale flag.
- * Called immediately after a provider succeeds.
- */
-function _recordLastSuccess(provider) {
-  _initMetrics();
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  if (priceFeedLastSuccessTimestamp) priceFeedLastSuccessTimestamp.set({ provider }, nowSeconds);
-  if (priceFeedStale)               priceFeedStale.set({ provider }, 0);
+// ── In-process LRU cache (fallback when Redis unavailable) ───────────────────
+//
+// LruMap is a minimal least-recently-used Map backed by the native Map whose
+// insertion/access order we maintain explicitly:
+//   - On get: delete then re-insert so the key moves to the "most recent" end.
+//   - On set: same re-insert pattern, then evict the oldest entry when over cap.
+//
+// This gives O(1) get/set/evict with no external dependencies.
+//
+// Structure: LruMap<CURRENCY, { rates, fetchedAt (ms), lastSuccessfulFetch (ms) }>
+
+class LruMap {
+  constructor(maxSize) {
+    this._max  = Math.max(1, maxSize);
+    this._map  = new Map();
+  }
+
+  has(key) {
+    return this._map.has(key);
+  }
+
+  get(key) {
+    if (!this._map.has(key)) return undefined;
+    // Move to most-recently-used position.
+    const value = this._map.get(key);
+    this._map.delete(key);
+    this._map.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this._map.has(key)) this._map.delete(key);
+    this._map.set(key, value);
+    // Evict the oldest (first) entry when over capacity.
+    if (this._map.size > this._max) {
+      const oldest = this._map.keys().next().value;
+      this._map.delete(oldest);
+      logger.debug("LRU local cache evicted", { evicted: oldest, size: this._map.size });
+    }
+  }
+
+  delete(key) {
+    return this._map.delete(key);
+  }
+
+  clear() {
+    this._map.clear();
+  }
+
+  get size() {
+    return this._map.size;
+  }
+
+  /** Iterate over [key, value] pairs — for getCachedRates() compatibility. */
+  [Symbol.iterator]() {
+    return this._map[Symbol.iterator]();
+  }
 }
 
-/**
- * Mark the feed as stale for a provider.
- * Called when the stale-while-revalidate window is exhausted and the cache
- * can no longer serve any usable rate for the given provider.
- */
-function _recordStale(provider) {
-  _initMetrics();
-  if (priceFeedStale) priceFeedStale.set({ provider }, 1);
-}
-
-// ── In-process cache (fallback when Redis unavailable) ───────────────────────
-// Structure: Map<CURRENCY, { rates, fetchedAt (ms), lastSuccessfulFetch (ms) }>
-
-const _localCache = new Map();
+const _localCache = new LruMap(CURRENCY_LRU_MAX_SIZE);
 
 // ── In-flight deduplication ──────────────────────────────────────────────────
 const _inFlight = new Map();
+
+// ── Supported currencies cache (#889) ────────────────────────────────────────
+// CoinGecko's /simple/supported_vs_currencies endpoint returns the authoritative
+// list of fiat/crypto codes accepted by the price API.  We cache this for
+// SUPPORTED_CURRENCIES_TTL_MS and refresh lazily so that school create/update
+// can validate localCurrency up-front rather than discovering the error at
+// conversion time.
+
+// Static fallback — covers the most common fiat codes so validation still
+// works when the network is unavailable at startup.
+const STATIC_FALLBACK_CURRENCIES = new Set([
+  "usd","eur","gbp","jpy","aud","cad","chf","cny","hkd","nzd",
+  "sek","krw","sgd","nok","mxn","inr","rub","zar","try","brl",
+  "twd","dkk","pln","thb","idr","huf","czk","ils","clp","php",
+  "aed","cop","sar","myr","ron","ngn","kes","ghs","ugx","tzs",
+  "rwf","etb","xof","mad","egp","pkr","bdt","vnd","pgk",
+]);
+
+let _supportedCurrenciesCache = null; // Set<string> (lowercase) | null
+let _supportedCurrenciesFetchedAt = 0;
+let _supportedCurrenciesInFlight = null;
+
+/**
+ * Return the set of vs_currencies supported by CoinGecko.
+ * Refreshed at most once per SUPPORTED_CURRENCIES_TTL_MS.
+ * Falls back to STATIC_FALLBACK_CURRENCIES on network failure.
+ *
+ * @returns {Promise<Set<string>>}  lowercase currency codes
+ */
+async function getSupportedCurrencies() {
+  const now = Date.now();
+  // Return cached set when still fresh.
+  if (_supportedCurrenciesCache && now - _supportedCurrenciesFetchedAt < SUPPORTED_CURRENCIES_TTL_MS) {
+    return _supportedCurrenciesCache;
+  }
+
+  // Deduplicate concurrent callers.
+  if (_supportedCurrenciesInFlight) {
+    try { return await _supportedCurrenciesInFlight; } catch { /* fall through */ }
+  }
+
+  _supportedCurrenciesInFlight = (async () => {
+    try {
+      let url = "https://api.coingecko.com/api/v3/simple/supported_vs_currencies";
+      if (COINGECKO_API_KEY) url += `?x_cg_pro_api_key=${encodeURIComponent(COINGECKO_API_KEY)}`;
+      const data = await httpsGet(url);
+      if (!Array.isArray(data) || data.length === 0) throw new Error("Empty supported_vs_currencies response");
+      const currencies = new Set(data.map((c) => String(c).toLowerCase()));
+      _supportedCurrenciesCache = currencies;
+      _supportedCurrenciesFetchedAt = Date.now();
+      logger.info("Supported vs_currencies list refreshed", { count: currencies.size });
+      return currencies;
+    } catch (err) {
+      logger.warn("Could not fetch supported_vs_currencies from CoinGecko — using static fallback", {
+        error: err.message,
+      });
+      // Return stale cache if available, otherwise static fallback.
+      return _supportedCurrenciesCache || STATIC_FALLBACK_CURRENCIES;
+    } finally {
+      _supportedCurrenciesInFlight = null;
+    }
+  })();
+
+  return _supportedCurrenciesInFlight;
+}
+
+/**
+ * Validate that `currencyCode` is in CoinGecko's supported vs_currencies list.
+ * Returns { valid: boolean, supported: Set<string> }.
+ *
+ * @param {string} currencyCode  — e.g. "USD", "ngn", "PGK"
+ * @returns {Promise<{ valid: boolean, supported: Set<string> }>}
+ */
+async function isSupportedCurrency(currencyCode) {
+  const supported = await getSupportedCurrencies();
+  return { valid: supported.has(String(currencyCode).toLowerCase()), supported };
+}
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
@@ -244,6 +473,12 @@ async function _fetchRates(currency) {
 async function getRates(currency) {
   const key = currency.toUpperCase();
 
+  // Reject unsupported currencies immediately — don't hit the price feed or
+  // the cache for codes that will never succeed (fix #888 allowlist).
+  if (!_isCurrencyAllowed(key)) {
+    throw new Error(`Currency "${key}" is not in the supported fiat allowlist`);
+  }
+
   // Return from cache if fresh.
   const cached = await _readCache(key);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
@@ -291,6 +526,13 @@ async function getRates(currency) {
 
 async function convertToLocalCurrency(amount, assetCode = "XLM", targetCurrency = "USD") {
   const currency  = targetCurrency.toUpperCase();
+
+  // Fast-path: reject unsupported currencies without touching the cache or feed.
+  if (!_isCurrencyAllowed(currency)) {
+    logger.warn("Currency not in allowlist", { currency });
+    return { localAmount: null, currency, rate: null, rateTimestamp: null, available: false, stale: false, staleAge: null, unsupportedCurrency: true };
+  }
+
   const rateEntry = await getRates(currency);
 
   if (!rateEntry) {
@@ -305,7 +547,7 @@ async function convertToLocalCurrency(amount, assetCode = "XLM", targetCurrency 
   }
 
   return {
-    localAmount:   parseFloat((amount * rate).toFixed(2)),
+    localAmount:   _decimalMultiply(amount, rate, currency),
     currency,
     rate,
     rateTimestamp: new Date(rateEntry.fetchedAt).toISOString(),
@@ -341,7 +583,8 @@ async function formatWithLocalEquivalent(amount, assetCode = "XLM", targetCurren
   const base = `${parseFloat(amount).toFixed(7)} ${assetCode}`;
   const conv = await convertToLocalCurrency(amount, assetCode, targetCurrency);
   if (!conv.available || conv.localAmount === null) return `${base} (rate unavailable)`;
-  return `${base} (≈ ${conv.localAmount.toFixed(2)} ${conv.currency})`;
+  const dp = CURRENCY_DECIMALS[conv.currency.toUpperCase()] ?? 2;
+  return `${base} (≈ ${conv.localAmount.toFixed(dp)} ${conv.currency})`;
 }
 
 function getCachedRates() {
@@ -354,6 +597,7 @@ function getCachedRates() {
 
 function resetCache() {
   _localCache.clear();
+  _inFlight.clear();
 }
 
 // Back-compat aliases
@@ -388,6 +632,80 @@ async function captureFiatSnapshot(amount, assetCode = "XLM", currency = "USD") 
   }
 }
 
+// ── CoinGecko response contract canary (#893) ─────────────────────────────────
+//
+// Validates that a CoinGecko /simple/price response for the given currency
+// still conforms to the expected shape.  Returns { ok: true } when valid or
+// { ok: false, reason: string } when the shape has changed.
+//
+// Intended use:
+//   1. In periodic health checks / cron jobs to detect silent API drift.
+//   2. In contract tests against a recorded fixture to prevent regressions.
+//
+// Expected shape (documented contract):
+//   data.stellar[lc_currency]     — positive finite number  (XLM rate)
+//   data['usd-coin'][lc_currency] — positive finite number  (USDC rate)
+function checkCoinGeckoResponseShape(data, currency) {
+  const lc = (currency || "").toLowerCase();
+
+  if (!data || typeof data !== "object") {
+    return { ok: false, reason: "response is not an object" };
+  }
+  if (!data.stellar || typeof data.stellar !== "object") {
+    return { ok: false, reason: 'missing top-level key "stellar"' };
+  }
+  if (!data["usd-coin"] || typeof data["usd-coin"] !== "object") {
+    return { ok: false, reason: 'missing top-level key "usd-coin"' };
+  }
+
+  const xlmRate  = data.stellar[lc];
+  const usdcRate = data["usd-coin"][lc];
+
+  if (typeof xlmRate !== "number" || !isFinite(xlmRate) || xlmRate <= 0) {
+    return { ok: false, reason: `stellar.${lc} is not a positive finite number (got ${JSON.stringify(xlmRate)})` };
+  }
+  if (typeof usdcRate !== "number" || !isFinite(usdcRate) || usdcRate <= 0) {
+    return { ok: false, reason: `usd-coin.${lc} is not a positive finite number (got ${JSON.stringify(usdcRate)})` };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Periodic canary: fetches a live CoinGecko rate for `currency` (default
+ * "usd") and validates the response shape.  Logs a warning when the shape
+ * has drifted so operators are alerted before conversions silently fail.
+ *
+ * Never throws — designed to be called from a health check or cron without
+ * disrupting the main application flow.
+ *
+ * @param {string} [currency="usd"]
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
+async function runCoinGeckoCanary(currency = "usd") {
+  try {
+    let url =
+      "https://api.coingecko.com/api/v3/simple/price" +
+      `?ids=stellar%2Cusd-coin&vs_currencies=${encodeURIComponent(currency)}`;
+    if (COINGECKO_API_KEY) url += `&x_cg_pro_api_key=${encodeURIComponent(COINGECKO_API_KEY)}`;
+
+    const data   = await httpsGet(url);
+    const result = checkCoinGeckoResponseShape(data, currency);
+
+    if (!result.ok) {
+      _recordAvailable("coingecko", false);
+      logger.warn("CoinGecko canary: response shape mismatch", { currency, reason: result.reason });
+    } else {
+      logger.info("CoinGecko canary: response shape OK", { currency });
+    }
+
+    return result;
+  } catch (err) {
+    logger.warn("CoinGecko canary: fetch failed", { currency, error: err.message });
+    return { ok: false, reason: err.message };
+  }
+}
+
 module.exports = {
   convertToLocalCurrency,
   enrichPaymentWithConversion,
@@ -399,8 +717,18 @@ module.exports = {
   convertXlmToLocal,
   formatWithConversion,
   attachConversion,
+  // #889 — currency validation
+  getSupportedCurrencies,
+  isSupportedCurrency,
+  // #893 — CoinGecko contract validation
+  checkCoinGeckoResponseShape,
+  runCoinGeckoCanary,
+  CURRENCY_DECIMALS,
   // Testing internals
   _fetchRatesFromCoinGecko: (c) => _fetchFromCoinGecko(c),
   _getRates: getRates,
   _getCache: getCachedRates,
+  _resetAllowlist,
+  _getAllowlist: () => ALLOWED_FIAT_CURRENCIES,
+  _getLocalCacheSize: () => _localCache.size,
 };

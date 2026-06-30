@@ -5,9 +5,10 @@ const School = require('../models/schoolModel');
 const Payment = require('../models/paymentModel');
 const Student = require('../models/studentModel');
 const { server } = require('../config/stellarConfig');
-const { extractValidPayment, validatePaymentAgainstFee, detectMemoCollision, detectCrossSchoolMemoCollision, detectAbnormalPatterns, determineConfirmationState } = require('./stellarService');
+const { extractValidPayment, detectMemoCollision, detectCrossSchoolMemoCollision, detectAbnormalPatterns, determineConfirmationState } = require('./stellarService');
 const { CONFIRMATION_STATES, isConfirmedOrAbove } = require('./paymentConfirmationStateMachine');
 const { validatePaymentAmount } = require('../utils/paymentLimits');
+const { compareAmounts, toStroops, stroopsToNumber, normalizeToNumber } = require('../utils/stellarAmount');
 const { generateReferenceCode } = require('../utils/generateReferenceCode');
 const { emit: sseEmit } = require('./sseService');
 const lock = require('./distributedLock');
@@ -15,6 +16,15 @@ const config = require('../config');
 const logger = require('../utils/logger').child('TransactionPollingService');
 const { deriveCorrelationId } = require('../utils/correlationId');
 const { captureFiatSnapshot } = require('./currencyConversionService');
+
+// Metrics — imported lazily inside helpers to survive jest module resets.
+function _incFunnel(stage, schoolId) {
+  try {
+    require('../metrics').paymentFunnelTotal.inc({ stage, school_id: schoolId });
+  } catch (_) {
+    // metrics module unavailable — proceed without instrumentation
+  }
+}
 
 let pollingInterval = null;
 let isPolling = false;
@@ -24,7 +34,15 @@ let isPolling = false;
 const SYNC_INTERVAL_MS = config.SYNC_INTERVAL_MS;
 // TTL of the per-school distributed sync lock (crash-safety net).
 const SYNC_LOCK_TTL_MS = config.SYNC_LOCK_TTL_MS;
-const TRANSACTIONS_PER_POLL = 20;
+// Safety cap on how many pages a single poll cycle will drain for one school.
+// Bounds per-cycle work while letting a fresh school's history backfill across
+// cycles (default: up to 50 pages × batchSize tx/cycle). Configurable.
+const MAX_PAGES_PER_POLL = parseInt(process.env.SYNC_MAX_PAGES_PER_POLL || '50', 10);
+// Adaptive batch sizing (#972): the per-page Horizon fetch size scales down as
+// the processing queue fills, between MIN and MAX, starting from BASE.
+const BASE_TRANSACTIONS_PER_POLL = 20;
+const MIN_TRANSACTIONS_PER_POLL = 5;
+const MAX_TRANSACTIONS_PER_POLL = 50;
 
 // Exponential backoff state — reset on first successful poll after errors.
 // POLL_MAX_BACKOFF_MS defaults to 5 minutes; configurable via env var.
@@ -35,7 +53,7 @@ let currentIntervalMs = SYNC_INTERVAL_MS;
 /**
  * Process a single transaction for a school
  */
-async function processTransaction(tx, school) {
+async function processTransaction(tx, school, fencingToken) {
   const { schoolId, stellarAddress } = school;
   const correlationId = deriveCorrelationId(tx.hash);
 
@@ -49,6 +67,9 @@ async function processTransaction(tx, school) {
     return { processed: false, reason: 'duplicate' };
   }
 
+  // Funnel: transaction received by the poller
+  _incFunnel('received', schoolId);
+
   // Extract and validate payment
   const valid = await extractValidPayment(tx, stellarAddress);
   if (!valid) {
@@ -56,7 +77,8 @@ async function processTransaction(tx, school) {
   }
 
   const { payOp, memo, asset } = valid;
-  const paymentAmount = parseFloat(payOp.amount);
+  // Exact stroop-based normalization (#842) — never parseFloat a monetary value.
+  const paymentAmount = normalizeToNumber(payOp.amount);
 
   // Validate payment amount is within configured limits
   const limitValidation = validatePaymentAmount(paymentAmount);
@@ -71,11 +93,29 @@ async function processTransaction(tx, school) {
     return { processed: false, reason: 'amount_limit_exceeded' };
   }
 
+  // Funnel: payment passed amount/memo validation
+  _incFunnel('validated', schoolId);
+
   // Find student by memo (studentId)
   const student = await Student.findOne({ schoolId, studentId: memo });
   if (!student) {
     logger.warn('Student not found for memo', { txHash: tx.hash, correlationId, schoolId, memo });
     return { processed: false, reason: 'student_not_found' };
+  }
+
+  // Funnel: student matched by memo
+  _incFunnel('matched', schoolId);
+
+  // Check fencing token - reject if stale (another worker has newer lock)
+  const currentFence = await lock.getCurrentFence(`sync:lock:${schoolId}`);
+  if (currentFence !== null && currentFence !== fencingToken) {
+    logger.warn('Stale fencing token - another worker acquired lock', {
+      schoolId,
+      expectedFence: fencingToken,
+      currentFence,
+      txHash: tx.hash,
+    });
+    return { processed: false, reason: 'stale_lock' };
   }
 
   const senderAddress = payOp.from || null;
@@ -112,19 +152,20 @@ async function processTransaction(tx, school) {
     { $group: { _id: null, total: { $sum: '$amount' } } },
   ]);
   const previousTotal = previousPayments.length ? previousPayments[0].total : 0;
-  const cumulativeTotal = parseFloat((previousTotal + paymentAmount).toFixed(7));
-  const remaining = parseFloat((student.feeAmount - cumulativeTotal).toFixed(7));
+  // Sum/diff in exact stroop space (#842) so an exact cumulative match is never
+  // mis-flagged as underpaid/overpaid by a float rounding epsilon.
+  const cumulativeTotal = stroopsToNumber(toStroops(previousTotal) + toStroops(paymentAmount));
+  const remaining = stroopsToNumber(toStroops(student.feeAmount) - toStroops(cumulativeTotal));
 
+  const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
   let cumulativeStatus;
-  if (cumulativeTotal < student.feeAmount) cumulativeStatus = 'underpaid';
-  else if (cumulativeTotal > student.feeAmount) cumulativeStatus = 'overpaid';
+  if (cumulativeVsFee < 0) cumulativeStatus = 'underpaid';
+  else if (cumulativeVsFee > 0) cumulativeStatus = 'overpaid';
   else cumulativeStatus = 'valid';
 
   const excessAmount = cumulativeStatus === 'overpaid'
-    ? parseFloat((cumulativeTotal - student.feeAmount).toFixed(7))
+    ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
     : 0;
-
-  const feeValidation = validatePaymentAgainstFee(paymentAmount, student.feeAmount);
 
   // Extract network fee
   const networkFee = parseFloat(tx.fee_paid || '0') / 10000000;
@@ -154,7 +195,7 @@ async function processTransaction(tx, school) {
     networkFee,
     // #883 — snapshot fiat rate at confirmation (best-effort; null if feed unavailable)
     fiatSnapshot: isConfirmed && !isSuspicious
-      ? await captureFiatSnapshot(paymentAmount, assetCode || 'XLM', process.env.DEFAULT_FIAT_CURRENCY || 'USD')
+      ? await captureFiatSnapshot(paymentAmount, asset || 'XLM', process.env.DEFAULT_FIAT_CURRENCY || 'USD')
       : null,
   };
 
@@ -185,7 +226,7 @@ async function processTransaction(tx, school) {
       feeValidationStatus: cumulativeStatus,
       status: paymentData.status,
       confirmedAt: txDate,
-    });
+    }, correlationId);
 
     logger.info('Transaction auto-detected and recorded', {
       txHash: tx.hash,
@@ -213,6 +254,26 @@ async function processTransaction(tx, school) {
 /**
  * Poll transactions for a single school.
  *
+ * Cursor management (#839): the poller persists a per-school Horizon
+ * `paging_token` cursor (`school.syncCursor`) and resumes ASCENDING paging from
+ * it every cycle. This is the key to being both gap-free and efficient:
+ *   - Ascending order from the saved cursor means we always move forward and
+ *     never skip a transaction (no missed payments).
+ *   - Persisting the cursor means we never replay history from genesis on each
+ *     cycle (no unbounded re-scans / excess Horizon load). A fresh school with
+ *     no cursor starts from the oldest transaction and backfills across cycles,
+ *     bounded by MAX_PAGES_PER_POLL per cycle.
+ * The cursor is advanced over EVERY examined transaction (processed or skipped)
+ * and persisted after each page, so a crash mid-cycle resumes correctly without
+ * gaps or rescans.
+ *
+ * Horizon 429 / errors: any Horizon failure (including HTTP 429 rate limiting)
+ * throws out of the page fetch and is reported as `horizonError`, which drives
+ * the cycle-level exponential backoff in pollAllSchools. Because the cursor is
+ * only advanced for transactions we actually examined and persisted, a 429
+ * mid-cycle never skips transactions — the next cycle resumes from the last
+ * persisted token.
+ *
  * Wrapped in a per-school distributed lock (Redis SET NX PX) so that, across
  * horizontally-scaled replicas or an overlapping slow poll, only one worker
  * syncs a given school at a time. If the lock is already held the cycle is
@@ -220,34 +281,117 @@ async function processTransaction(tx, school) {
  * duplicate writes does not depend on the lock: the unique index on Payment
  * remains the authoritative dedup guard if the lock ever expires mid-poll.
  */
+function getQueueBackpressureState() {
+  try {
+    const { concurrentPaymentProcessor } = require('./concurrentPaymentProcessor');
+    const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
+    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
+    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+    return { queueDepth, maxQueueDepth, highWater, lowWater };
+  } catch (error) {
+    logger.warn('Unable to read payment processor stats for polling backpressure', {
+      error: error.message,
+    });
+    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, config.MAX_QUEUE_DEPTH);
+    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+    return { queueDepth: 0, maxQueueDepth: config.MAX_QUEUE_DEPTH, highWater, lowWater };
+  }
+}
+
+function getEffectiveBatchSize(queueDepth) {
+  const { highWater, lowWater } = getQueueBackpressureState();
+  if (queueDepth >= highWater) return 0;
+  if (queueDepth <= lowWater) return BASE_TRANSACTIONS_PER_POLL;
+
+  const pressureRatio = (queueDepth - lowWater) / Math.max(1, highWater - lowWater);
+  const scaled = Math.round(BASE_TRANSACTIONS_PER_POLL * (1 - pressureRatio));
+  return Math.max(MIN_TRANSACTIONS_PER_POLL, Math.min(MAX_TRANSACTIONS_PER_POLL, scaled));
+}
+
 async function pollSchoolTransactions(school) {
+  const backpressure = getQueueBackpressureState();
+  if (backpressure.queueDepth >= backpressure.highWater) {
+    logger.warn('Skipping school poll due to high payment processor queue depth', {
+      schoolId: school.schoolId,
+      queueDepth: backpressure.queueDepth,
+      highWater: backpressure.highWater,
+    });
+    return {
+      schoolId: school.schoolId,
+      processed: 0,
+      skipped: 0,
+      loadPaused: true,
+      queueDepth: backpressure.queueDepth,
+    };
+  }
+
   const lockKey = `sync:lock:${school.schoolId}`;
-  const token = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
-  if (!token) {
+  const acquired = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
+  if (!acquired) {
     logger.debug('Skipping school poll — sync lock held by another worker', {
       schoolId: school.schoolId,
     });
     return { schoolId: school.schoolId, processed: 0, skipped: 0, lockSkipped: true };
   }
 
+  const { token, fencingToken } = acquired;
+  const stopWatchdog = lock.startWatchdog
+    ? lock.startWatchdog(lockKey, token, SYNC_LOCK_TTL_MS)
+    : null;
+
+  let cursor = school.syncCursor || null;
+  const startCursor = cursor;
+  let processedCount = 0;
+  let skippedCount = 0;
+
   try {
-    const transactions = await server
-      .transactions()
-      .forAccount(school.stellarAddress)
-      .order('desc')
-      .limit(TRANSACTIONS_PER_POLL)
-      .call();
+    // Adaptive batch size based on queue backpressure (#972). The early
+    // load-pause guard above already bails when the queue is saturated, so
+    // here batchSize is always >= MIN_TRANSACTIONS_PER_POLL.
+    const batchSize = getEffectiveBatchSize(backpressure.queueDepth);
+    if (batchSize !== BASE_TRANSACTIONS_PER_POLL) {
+      logger.debug('Adjusted poll batch size based on queue depth', {
+        schoolId: school.schoolId,
+        queueDepth: backpressure.queueDepth,
+        batchSize,
+      });
+    }
 
-    let processedCount = 0;
-    let skippedCount = 0;
+    for (let pages = 0; pages < MAX_PAGES_PER_POLL; pages++) {
+      let builder = server
+        .transactions()
+        .forAccount(school.stellarAddress)
+        .order('asc')
+        .limit(batchSize);
+      // Resume from the persisted cursor; omit on first-ever run so Horizon
+      // returns from the oldest transaction.
+      if (cursor) builder = builder.cursor(cursor);
 
-    for (const tx of transactions.records) {
-      const result = await processTransaction(tx, school);
-      if (result.processed) {
-        processedCount++;
-      } else {
-        skippedCount++;
+      const page = await builder.call();
+      const records = (page && page.records) || [];
+      if (records.length === 0) break;
+
+      for (const tx of records) {
+        const result = await processTransaction(tx, school, fencingToken);
+        if (result.processed) {
+          processedCount++;
+        } else {
+          skippedCount++;
+        }
+        // Advance past every examined tx — we never need to re-read it. Reorg /
+        // confirmation promotion is handled separately by finalizeConfirmedPayments.
+        if (tx.paging_token) cursor = tx.paging_token;
       }
+
+      // Persist the cursor after each page so a crash resumes without gaps/rescans.
+      if (cursor && cursor !== startCursor) {
+        await School.updateOne(
+          { schoolId: school.schoolId },
+          { $set: { syncCursor: cursor } },
+        );
+      }
+
+      if (records.length < batchSize) break; // drained this cycle
     }
 
     if (processedCount > 0) {
@@ -255,17 +399,22 @@ async function pollSchoolTransactions(school) {
         schoolId: school.schoolId,
         processed: processedCount,
         skipped: skippedCount,
+        cursor,
       });
     }
 
-    return { schoolId: school.schoolId, processed: processedCount, skipped: skippedCount };
+    return { schoolId: school.schoolId, processed: processedCount, skipped: skippedCount, cursor };
   } catch (error) {
+    const status = error.response?.status || error.status || error.statusCode;
     logger.error('Error polling school transactions', {
       schoolId: school.schoolId,
       error: error.message,
+      status,
+      rateLimited: status === 429,
     });
-    return { schoolId: school.schoolId, error: error.message, horizonError: true };
+    return { schoolId: school.schoolId, error: error.message, horizonError: true, status };
   } finally {
+    if (stopWatchdog) stopWatchdog();
     await lock.release(lockKey, token);
   }
 }

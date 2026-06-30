@@ -10,6 +10,7 @@ const LEADER_ACQUIRE_INTERVAL_MS = parseInt(process.env.LEADER_ACQUIRE_INTERVAL_
 
 let _isLeader = false;
 let _token = null;
+let _fencingToken = null;
 let _renewTimer = null;
 let _acquireTimer = null;
 let _callbacks = { onElected: [], onDemoted: [] };
@@ -21,33 +22,34 @@ function register(onElected, onDemoted) {
 }
 
 async function _tryAcquire() {
-  const token = await lock.acquire(LEADER_LOCK_KEY, LEADER_LOCK_TTL_MS);
-  if (token && !_isLeader) {
+  const acquired = await lock.acquire(LEADER_LOCK_KEY, LEADER_LOCK_TTL_MS);
+  if (acquired && !_isLeader) {
     _isLeader = true;
-    _token = token;
-    logger.info('Elected leader — starting leader callbacks');
+    _token = acquired.token;
+    _fencingToken = acquired.fencingToken;
+    logger.info('Elected leader — starting leader callbacks', { fencingToken: acquired.fencingToken });
     _startRenew();
     for (const cb of _callbacks.onElected) {
       try { cb(); } catch (err) { logger.error('Leader elected callback failed', { error: err.message }); }
     }
   }
-  return !!token;
+  return !!acquired;
 }
 
 async function _renew() {
   if (!_isLeader || !_token) return;
-  const renewed = await lock.acquire(LEADER_LOCK_KEY, LEADER_LOCK_TTL_MS);
+  const renewed = await lock.renew(LEADER_LOCK_KEY, _token, LEADER_LOCK_TTL_MS);
   if (!renewed) {
     logger.warn('Lost leadership — lock taken by another instance');
     _demote();
     return;
   }
-  _token = renewed;
 }
 
 function _demote() {
   _isLeader = false;
   _token = null;
+  _fencingToken = null;
   _stopRenew();
   logger.info('Demoted from leader — stopping leader callbacks');
   for (const cb of _callbacks.onDemoted) {
@@ -115,9 +117,14 @@ function isLeader() {
   return _isLeader;
 }
 
+function getFencingToken() {
+  return _fencingToken;
+}
+
 module.exports = {
   start,
   stop,
   isLeader,
   register,
+  getFencingToken,
 };

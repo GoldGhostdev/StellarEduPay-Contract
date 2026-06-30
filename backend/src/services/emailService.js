@@ -6,6 +6,7 @@
  */
 
 const logger = require('../utils/logger');
+const { createEmailDelivery, updateEmailDeliveryStatus } = require('./emailDeliveryService');
 
 /**
  * Send payment receipt email to parent/student contact email.
@@ -32,6 +33,17 @@ async function sendPaymentReceipt(options) {
     return { skipped: true };
   }
 
+  const deliveryRecord = await createEmailDelivery({
+    schoolId: options.schoolId || null,
+    studentId: options.studentId || null,
+    type: 'receipt',
+    provider: 'mock',
+    status: 'queued',
+    providerMessageId: null,
+    sentAt: null,
+    payload: { to, studentName, amount, txHash, confirmedAt, remainingBalance },
+  });
+
   try {
     // TODO: Integrate with actual email provider (SendGrid, AWS SES, etc.)
     // For now, log the email that would be sent
@@ -43,14 +55,21 @@ async function sendPaymentReceipt(options) {
       txHash,
       confirmedAt,
       remainingBalance,
+      deliveryId: deliveryRecord._id,
     });
 
-    // Return mock result for testing
-    return {
+    const result = {
       messageId: `mock-${Date.now()}`,
       to,
       subject: `Payment Receipt for ${studentName}`,
     };
+
+    await updateEmailDeliveryStatus({ recordId: deliveryRecord._id }, 'sent', {
+      providerMessageId: result.messageId,
+      sentAt: new Date(),
+    });
+
+    return result;
   } catch (err) {
     logger.error({
       msg: 'Failed to send payment receipt email',
@@ -58,6 +77,7 @@ async function sendPaymentReceipt(options) {
       studentName,
       error: err.message,
     });
+    await updateEmailDeliveryStatus({ recordId: deliveryRecord._id }, 'failed', { reason: err.message });
     throw err;
   }
 }

@@ -24,6 +24,12 @@ const { getPaymentLimits, validatePaymentAmount } = require('../utils/paymentLim
 const { convertToLocalCurrency } = require('../services/currencyConversionService');
 const { withStellarRetry } = require('../utils/withStellarRetry');
 const { makePaymentAuditLogger } = require('../utils/paymentAuditLogger');
+const lock = require('../services/distributedLock');
+const logger = require('../utils/logger');
+
+// TTL for the per-school distributed verify lock.  Verify is a fast Horizon
+// round-trip; 30 s is more than enough while still auto-expiring on crash.
+const VERIFY_LOCK_TTL_MS = parseInt(process.env.VERIFY_LOCK_TTL_MS || '30000', 10);
 
 // Permanent error codes that should NOT be retried
 const PERMANENT_FAIL_CODES = [
@@ -279,176 +285,191 @@ async function verifyPayment(req, res, next) {
       });
     }
 
-    let result;
+    // Issue #69 — distributed lock prevents two replicas from concurrently
+    // verifying the same transaction, which would risk a double-write race even
+    // though the unique index on Payment { schoolId, txHash } is the ultimate
+    // dedup guard.  The lock is keyed per (school, txHash) so only identical
+    // concurrent verify calls contend — different hashes proceed in parallel.
+    const verifyLockKey = `sync:lock:${schoolId}:verify:${normalizedHash}`;
+    const verifyToken = await lock.acquire(verifyLockKey, VERIFY_LOCK_TTL_MS);
+    if (!verifyToken) {
+      return res.status(409).json({ error: 'Sync already in progress', code: 'SYNC_IN_PROGRESS' });
+    }
+
     try {
-      // Pass schoolId so verifyTransaction scopes the student lookup to this school (#845).
-      result = await verifyTransaction(normalizedHash, req.school.stellarAddress, schoolId);
-    } catch (stellarErr) {
-      if (PERMANENT_FAIL_CODES.includes(stellarErr.code)) {
-        await audit.failure(stellarErr.message, { txHash: normalizedHash, errorCode: stellarErr.code });
-        await Payment.create({ schoolId, studentId: 'unknown', txHash: normalizedHash, amount: 0, status: 'FAILED', feeValidationStatus: 'unknown' }).catch(() => {});
-        return next(stellarErr);
+      let result;
+      try {
+        // Pass schoolId so verifyTransaction scopes the student lookup to this school (#845).
+        result = await verifyTransaction(normalizedHash, req.school.stellarAddress, schoolId);
+      } catch (stellarErr) {
+        if (PERMANENT_FAIL_CODES.includes(stellarErr.code)) {
+          await audit.failure(stellarErr.message, { txHash: normalizedHash, errorCode: stellarErr.code });
+          await Payment.create({ schoolId, studentId: 'unknown', txHash: normalizedHash, amount: 0, status: 'FAILED', feeValidationStatus: 'unknown' }).catch(err => logger.error('[PaymentController] failed to persist permanent failure record', { txHash: normalizedHash, error: err.message }));
+          return next(stellarErr);
+        }
+
+        await audit.success({ txHash: normalizedHash, queuedForRetry: true, reason: stellarErr.message });
+        await queueForRetry(normalizedHash, req.body.studentId || null, stellarErr.message, schoolId);
+        return res.status(202).json({
+          message: 'Stellar network is temporarily unavailable. Your transaction has been queued and will be verified automatically.',
+          txHash: normalizedHash,
+          status: 'queued_for_retry',
+        });
       }
 
-      await audit.success({ txHash: normalizedHash, queuedForRetry: true, reason: stellarErr.message });
-      await queueForRetry(normalizedHash, req.body.studentId || null, stellarErr.message, schoolId);
-      return res.status(202).json({
-        message: 'Stellar network is temporarily unavailable. Your transaction has been queued and will be verified automatically.',
+      if (!result) {
+        await audit.failure('Transaction found but contains no valid payment to this school wallet', { txHash: normalizedHash });
+        return res.status(404).json({ error: 'Transaction found but contains no valid payment to this school wallet', code: 'NOT_FOUND' });
+      }
+
+      const studentStrId = result.studentId || result.memo;
+      const studentObj = await Student.findOne({ schoolId, studentId: studentStrId });
+      if (!studentObj) {
+        await audit.failure('Associated student not found', { txHash: normalizedHash, studentId: studentStrId });
+        return res.status(404).json({ error: 'Associated student not found. Cannot record transaction.' });
+      }
+
+      // Intents are a UX convenience; an expired intent must not block crediting (#848).
+      // Mark it expired for bookkeeping but continue to record the payment.
+      const intent = await PaymentIntent.findOne({ memo: result.memo, schoolId });
+      if (intent?.expiresAt && intent.expiresAt < new Date()) {
+        await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'expired' });
+      }
+
+      // Determine cumulative feeValidationStatus (#846).
+      // Partial payments (amount < fee) are accepted — money is already on-chain.
+      // The cumulative total drives the status; per-payment underpaid rejection
+      // is not applied here because a parent may be paying in installments.
+      const prevAgg = await Payment.aggregate([
+        { $match: { schoolId, studentId: studentStrId, deletedAt: null, status: 'SUCCESS' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      const prevTotal = prevAgg.length ? prevAgg[0].total : 0;
+      const cumulativeTotal = parseFloat((prevTotal + result.amount).toFixed(7));
+      let feeValidationStatus;
+      if (cumulativeTotal < studentObj.feeAmount) feeValidationStatus = 'partial';
+      else if (cumulativeTotal > studentObj.feeAmount) feeValidationStatus = 'overpaid';
+      else feeValidationStatus = 'valid';
+      const computedExcessAmount = feeValidationStatus === 'overpaid'
+        ? parseFloat((cumulativeTotal - studentObj.feeAmount).toFixed(7))
+        : 0;
+
+      const now = new Date();
+      try {
+        await recordPayment({
+          schoolId,
+          studentId: studentStrId,
+          txHash: result.hash,
+          amount: result.amount,
+          feeAmount: result.feeAmount || studentObj.feeAmount,
+          feeValidationStatus,
+          excessAmount: computedExcessAmount,
+          networkFee: result.networkFee,
+          status: 'SUCCESS',
+          memo: result.memo,
+          senderAddress: result.senderAddress || null,
+          ledgerSequence: result.ledger || null,
+          confirmationStatus: 'confirmed',
+          confirmedAt: result.date ? new Date(result.date) : now,
+          verifiedAt: now,
+        });
+      } catch (dupErr) {
+        if (dupErr.code === 'DUPLICATE_TX') {
+          // Concurrent path (poller or another verify call) already recorded this tx.
+          // Fetch and return the existing record as a cache hit.
+          const cached = await Payment.findOne({ schoolId, txHash: normalizedHash });
+          if (cached) {
+            await audit.success({ txHash: normalizedHash, cached: true, studentId: studentStrId, amount: cached.amount });
+            const targetCurrency = req.school.localCurrency || 'USD';
+            const cachedConv = await convertToLocalCurrency(cached.amount, cached.assetCode || 'XLM', targetCurrency);
+            return res.json({
+              verified: true, cached: true, hash: cached.txHash,
+              stellarExplorerUrl: getExplorerUrl(cached.txHash), explorerUrl: getExplorerUrl(cached.txHash),
+              memo: cached.memo, studentId: cached.studentId, amount: cached.amount,
+              assetCode: cached.assetCode, feeAmount: cached.feeAmount,
+              feeValidation: { status: cached.feeValidationStatus, excessAmount: cached.excessAmount },
+              date: cached.confirmedAt || cached.createdAt, status: cached.status,
+              localCurrency: {
+                amount: cachedConv.available ? cachedConv.localAmount : null,
+                currency: cachedConv.currency, rate: cachedConv.rate,
+                rateTimestamp: cachedConv.rateTimestamp, available: cachedConv.available,
+              },
+            });
+          }
+        }
+        throw dupErr;
+      }
+
+      // Update student record immediately after recording (#846) — sync path also does
+      // this, but the verify path never did, leaving totalPaid/remainingBalance stale.
+      await Student.findOneAndUpdate(
+        { schoolId, studentId: studentStrId },
+        {
+          totalPaid: cumulativeTotal,
+          remainingBalance: parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7)),
+          feePaid: cumulativeTotal >= studentObj.feeAmount,
+        },
+      );
+
+      await audit.success({
         txHash: normalizedHash,
-        status: 'queued_for_retry',
-      });
-    }
-
-    if (!result) {
-      await audit.failure('Transaction found but contains no valid payment to this school wallet', { txHash: normalizedHash });
-      return res.status(404).json({ error: 'Transaction found but contains no valid payment to this school wallet', code: 'NOT_FOUND' });
-    }
-
-    const studentStrId = result.studentId || result.memo;
-    const studentObj = await Student.findOne({ schoolId, studentId: studentStrId });
-    if (!studentObj) {
-      await audit.failure('Associated student not found', { txHash: normalizedHash, studentId: studentStrId });
-      return res.status(404).json({ error: 'Associated student not found. Cannot record transaction.' });
-    }
-
-    // Intents are a UX convenience; an expired intent must not block crediting (#848).
-    // Mark it expired for bookkeeping but continue to record the payment.
-    const intent = await PaymentIntent.findOne({ memo: result.memo, schoolId });
-    if (intent?.expiresAt && intent.expiresAt < new Date()) {
-      await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'expired' });
-    }
-
-    // Determine cumulative feeValidationStatus (#846).
-    // Partial payments (amount < fee) are accepted — money is already on-chain.
-    // The cumulative total drives the status; per-payment underpaid rejection
-    // is not applied here because a parent may be paying in installments.
-    const prevAgg = await Payment.aggregate([
-      { $match: { schoolId, studentId: studentStrId, deletedAt: null, status: 'SUCCESS' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]);
-    const prevTotal = prevAgg.length ? prevAgg[0].total : 0;
-    const cumulativeTotal = parseFloat((prevTotal + result.amount).toFixed(7));
-    let feeValidationStatus;
-    if (cumulativeTotal < studentObj.feeAmount) feeValidationStatus = 'partial';
-    else if (cumulativeTotal > studentObj.feeAmount) feeValidationStatus = 'overpaid';
-    else feeValidationStatus = 'valid';
-    const computedExcessAmount = feeValidationStatus === 'overpaid'
-      ? parseFloat((cumulativeTotal - studentObj.feeAmount).toFixed(7))
-      : 0;
-
-    const now = new Date();
-    try {
-      await recordPayment({
-        schoolId,
         studentId: studentStrId,
-        txHash: result.hash,
         amount: result.amount,
+        assetCode: result.assetCode || 'XLM',
+        feeValidationStatus,
+        duration: `${Date.now() - startTime}ms`,
+      });
+
+      // Auto-generate receipt (fire-and-forget)
+      const { createReceipt } = require('../services/receiptService');
+      createReceipt({
+        txHash: result.hash,
+        studentId: studentStrId,
+        schoolId,
+        amount: result.amount,
+        assetCode: result.assetCode || 'XLM',
         feeAmount: result.feeAmount || studentObj.feeAmount,
         feeValidationStatus,
-        excessAmount: computedExcessAmount,
-        networkFee: result.networkFee,
-        status: 'SUCCESS',
         memo: result.memo,
-        senderAddress: result.senderAddress || null,
-        ledgerSequence: result.ledger || null,
-        confirmationStatus: 'confirmed',
         confirmedAt: result.date ? new Date(result.date) : now,
-        verifiedAt: now,
+      }).catch(() => {});
+
+      const targetCurrency = req.school.localCurrency || 'USD';
+      const conversion = await convertToLocalCurrency(result.amount, result.assetCode || 'XLM', targetCurrency);
+      const stellarExplorerUrl = getExplorerUrl(result.hash);
+      const remainingBalance = parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7));
+
+      res.json({
+        verified: true,
+        cached: false,
+        hash: result.hash,
+        stellarExplorerUrl,
+        explorerUrl: stellarExplorerUrl,
+        memo: result.memo,
+        studentId: studentStrId,
+        amount: result.amount,
+        assetCode: result.assetCode,
+        assetType: result.assetType,
+        feeAmount: result.feeAmount || studentObj.feeAmount,
+        feeValidation: { status: feeValidationStatus, excessAmount: computedExcessAmount },
+        remainingBalance,
+        networkFee: result.networkFee,
+        date: result.date,
+        localCurrency: {
+          amount: conversion.available ? conversion.localAmount : null,
+          currency: conversion.currency,
+          rate: conversion.rate,
+          rateTimestamp: conversion.rateTimestamp,
+          available: conversion.available,
+        },
       });
-    } catch (dupErr) {
-      if (dupErr.code === 'DUPLICATE_TX') {
-        // Concurrent path (poller or another verify call) already recorded this tx.
-        // Fetch and return the existing record as a cache hit.
-        const cached = await Payment.findOne({ schoolId, txHash: normalizedHash });
-        if (cached) {
-          await audit.success({ txHash: normalizedHash, cached: true, studentId: studentStrId, amount: cached.amount });
-          const targetCurrency = req.school.localCurrency || 'USD';
-          const cachedConv = await convertToLocalCurrency(cached.amount, cached.assetCode || 'XLM', targetCurrency);
-          return res.json({
-            verified: true, cached: true, hash: cached.txHash,
-            stellarExplorerUrl: getExplorerUrl(cached.txHash), explorerUrl: getExplorerUrl(cached.txHash),
-            memo: cached.memo, studentId: cached.studentId, amount: cached.amount,
-            assetCode: cached.assetCode, feeAmount: cached.feeAmount,
-            feeValidation: { status: cached.feeValidationStatus, excessAmount: cached.excessAmount },
-            date: cached.confirmedAt || cached.createdAt, status: cached.status,
-            localCurrency: {
-              amount: cachedConv.available ? cachedConv.localAmount : null,
-              currency: cachedConv.currency, rate: cachedConv.rate,
-              rateTimestamp: cachedConv.rateTimestamp, available: cachedConv.available,
-            },
-          });
-        }
-      }
-      throw dupErr;
+    } finally {
+      await lock.release(verifyLockKey, verifyToken);
     }
-
-    // Update student record immediately after recording (#846) — sync path also does
-    // this, but the verify path never did, leaving totalPaid/remainingBalance stale.
-    await Student.findOneAndUpdate(
-      { schoolId, studentId: studentStrId },
-      {
-        totalPaid: cumulativeTotal,
-        remainingBalance: parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7)),
-        feePaid: cumulativeTotal >= studentObj.feeAmount,
-      },
-    );
-
-    await audit.success({
-      txHash: normalizedHash,
-      studentId: studentStrId,
-      amount: result.amount,
-      assetCode: result.assetCode || 'XLM',
-      feeValidationStatus,
-      duration: `${Date.now() - startTime}ms`,
-    });
-
-    // Auto-generate receipt (fire-and-forget)
-    const { createReceipt } = require('../services/receiptService');
-    createReceipt({
-      txHash: result.hash,
-      studentId: studentStrId,
-      schoolId,
-      amount: result.amount,
-      assetCode: result.assetCode || 'XLM',
-      feeAmount: result.feeAmount || studentObj.feeAmount,
-      feeValidationStatus,
-      memo: result.memo,
-      confirmedAt: result.date ? new Date(result.date) : now,
-    }).catch(() => {});
-
-    const targetCurrency = req.school.localCurrency || 'USD';
-    const conversion = await convertToLocalCurrency(result.amount, result.assetCode || 'XLM', targetCurrency);
-    const stellarExplorerUrl = getExplorerUrl(result.hash);
-    const remainingBalance = parseFloat(Math.max(0, studentObj.feeAmount - cumulativeTotal).toFixed(7));
-
-    res.json({
-      verified: true,
-      cached: false,
-      hash: result.hash,
-      stellarExplorerUrl,
-      explorerUrl: stellarExplorerUrl,
-      memo: result.memo,
-      studentId: studentStrId,
-      amount: result.amount,
-      assetCode: result.assetCode,
-      assetType: result.assetType,
-      feeAmount: result.feeAmount || studentObj.feeAmount,
-      feeValidation: { status: feeValidationStatus, excessAmount: computedExcessAmount },
-      remainingBalance,
-      networkFee: result.networkFee,
-      date: result.date,
-      localCurrency: {
-        amount: conversion.available ? conversion.localAmount : null,
-        currency: conversion.currency,
-        rate: conversion.rate,
-        rateTimestamp: conversion.rateTimestamp,
-        available: conversion.available,
-      },
-    });
   } catch (err) {
     await makePaymentAuditLogger(req, req.schoolId, req.body?.txHash || 'unknown')
       .failure(err.message, { error: err.message })
-      .catch(() => {});
+      .catch(() => logger.debug('[PaymentController] audit failure log missed', { txHash: req.body?.txHash || 'unknown' }));
     next(err);
   }
 }
