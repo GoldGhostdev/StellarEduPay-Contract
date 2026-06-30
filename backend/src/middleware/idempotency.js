@@ -110,7 +110,7 @@ function idempotency(req, res, next) {
                   });
             } else {
               // 5xx is never cached — release the reservation so the client can retry.
-              idempotencyStore.release(canonicalKey).catch(() => {});
+              idempotencyStore.release(canonicalKey).catch(() => logger.debug('[Idempotency] release missed'));
             }
             return originalJson(body);
           };

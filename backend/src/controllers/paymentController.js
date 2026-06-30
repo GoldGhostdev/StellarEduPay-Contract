@@ -25,6 +25,7 @@ const { convertToLocalCurrency } = require('../services/currencyConversionServic
 const { withStellarRetry } = require('../utils/withStellarRetry');
 const { makePaymentAuditLogger } = require('../utils/paymentAuditLogger');
 const lock = require('../services/distributedLock');
+const logger = require('../utils/logger');
 
 // TTL for the per-school distributed verify lock.  Verify is a fast Horizon
 // round-trip; 30 s is more than enough while still auto-expiring on crash.
@@ -303,7 +304,7 @@ async function verifyPayment(req, res, next) {
       } catch (stellarErr) {
         if (PERMANENT_FAIL_CODES.includes(stellarErr.code)) {
           await audit.failure(stellarErr.message, { txHash: normalizedHash, errorCode: stellarErr.code });
-          await Payment.create({ schoolId, studentId: 'unknown', txHash: normalizedHash, amount: 0, status: 'FAILED', feeValidationStatus: 'unknown' }).catch(() => {});
+          await Payment.create({ schoolId, studentId: 'unknown', txHash: normalizedHash, amount: 0, status: 'FAILED', feeValidationStatus: 'unknown' }).catch(err => logger.error('[PaymentController] failed to persist permanent failure record', { txHash: normalizedHash, error: err.message }));
           return next(stellarErr);
         }
 
@@ -468,7 +469,7 @@ async function verifyPayment(req, res, next) {
   } catch (err) {
     await makePaymentAuditLogger(req, req.schoolId, req.body?.txHash || 'unknown')
       .failure(err.message, { error: err.message })
-      .catch(() => {});
+      .catch(() => logger.debug('[PaymentController] audit failure log missed', { txHash: req.body?.txHash || 'unknown' }));
     next(err);
   }
 }

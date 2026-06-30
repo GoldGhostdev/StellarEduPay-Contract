@@ -122,7 +122,7 @@ async function jobProcessor(job) {
         amount:    0,
         status:    'FAILED',
         feeValidationStatus: 'unknown',
-      }).catch(() => {});
+      }).catch(() => logger.debug('[TxQueueService] persist permanent failure record missed', { txHash: job.data.txHash }));
 
       // Mark durable record as dead_letter
       await markDead(job.data.txHash, err);

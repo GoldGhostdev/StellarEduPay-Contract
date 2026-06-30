@@ -60,6 +60,7 @@ const { requireAdminAuth } = require('./middleware/auth');
 const { jsonDepthGuard, deduplicateQueryParams } = require('./middleware/sanitizeRequest');
 const { runConsistencyCheck } = require('./controllers/consistencyController');
 const { healthCheck, healthLive, healthReady } = require('./controllers/healthController');
+const { setupEnforceConsoleErrorLogging } = require('./errorHandling');
 const logger = require('./utils/logger');
 const { startHeapMonitoring } = require('./utils/heapMonitoring');
 
@@ -325,39 +326,42 @@ const server = require.main === module
   : { close: (cb) => cb && cb() };
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
+const {
+  setReady,
+  isReady,
+  isShutdownInProgress,
+  drainWorkers,
+  notifySSEClients,
+  closeQueues,
+  stopAcceptingNewWork,
+} = require('./services/shutdownManager');
+
 async function shutdown(signal) {
+  if (isShutdownInProgress()) {
+    logger.warn('Shutdown already in progress — ignoring duplicate signal');
+    return;
+  }
+
   logger.info(`Received ${signal} signal — starting graceful shutdown`);
+
+  setReady(false);
 
   const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 30_000;
 
-  // Stop background services — no new work accepted
-  stopPolling();
-  retrySelector.stop();
-
-  // Stop leader election (demotes leader, stops leader-only schedulers)
-  try {
-    const leaderElection = require('./services/leaderElection');
-    await leaderElection.stop();
-  } catch (_) { /* leader election may not have been started */ }
-
-  try {
-    await stopTxQueueWorker();
-    await closeQueue();
-    await bullMQRetryService.shutdownQueue();
-    await require('./services/sseService').close();
-    await require('./services/distributedLock').close();
-    await require('./services/schoolCacheInvalidator').close();
-    logger.info('BullMQ resources closed cleanly');
-  } catch (err) {
-    logger.error('Error closing BullMQ resources during shutdown', { error: err.message });
-  }
-
-  // Force exit after SHUTDOWN_TIMEOUT_MS regardless of in-flight requests
   const forceExitTimer = setTimeout(() => {
     logger.error(`Forced exit after ${SHUTDOWN_TIMEOUT_MS}ms shutdown timeout`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
-  forceExitTimer.unref(); // don't keep the event loop alive just for this timer
+  forceExitTimer.unref();
+
+  try {
+    await stopAcceptingNewWork();
+    await drainWorkers();
+    await notifySSEClients();
+    await closeQueues();
+  } catch (err) {
+    logger.error('Error during shutdown', { error: err.message });
+  }
 
   // (1) Stop accepting new connections; (2) wait for in-flight requests to finish;
   // (3) only then close the database connection.
@@ -378,4 +382,6 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-module.exports = app;
+setupEnforceConsoleErrorLogging();
+
+module.exports = { app, isReady };
