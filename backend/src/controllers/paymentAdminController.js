@@ -15,6 +15,11 @@ const { syncDurationSeconds } = require('../metrics');
 const { syncPaymentsForSchool } = require('../services/stellarService');
 const { initiateRefund, getRefundsByPayment, getRefundsBySchool } = require('../services/refundService');
 const { generateReconciliationReport } = require('../services/reconciliationService');
+const lock = require('../services/distributedLock');
+
+// TTL for the per-school distributed sync lock (60 s — long enough to complete
+// a full blockchain sync while short enough to auto-expire after a crash).
+const SYNC_LOCK_TTL_MS = parseInt(process.env.SYNC_LOCK_TTL_MS || '60000', 10);
 
 function wrapStellarError(err) {
   if (!err.code) {
@@ -24,14 +29,19 @@ function wrapStellarError(err) {
   return err;
 }
 
-const _syncLocks = new Set();
-
 async function syncAllPayments(req, res, next) {
   const { schoolId } = req;
-  if (_syncLocks.has(schoolId)) {
+
+  // Issue #69 — replace the in-process _syncLocks Set with a cross-replica
+  // distributed lock (Redis SET NX PX, in-process Map fallback when no Redis).
+  // Any replica that cannot acquire the lock immediately returns 409 so the
+  // caller knows a sync is already in flight somewhere in the cluster.
+  const lockKey = `sync:lock:${schoolId}`;
+  const token = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
+  if (!token) {
     return res.status(409).json({ error: 'Sync already in progress', code: 'SYNC_IN_PROGRESS' });
   }
-  _syncLocks.add(schoolId);
+
   const stopSyncTimer = syncDurationSeconds.startTimer();
   try {
     const summary = await syncPaymentsForSchool(req.school);
@@ -80,7 +90,7 @@ async function syncAllPayments(req, res, next) {
     next(wrapStellarError(err));
   } finally {
     stopSyncTimer();
-    _syncLocks.delete(schoolId);
+    await lock.release(lockKey, token);
   }
 }
 
@@ -557,5 +567,6 @@ module.exports = {
   verifyReceipt,
   getReconciliationReports,
   generateSchoolReconciliationReport,
-  _syncLocks,
+  // Exposed for testing — callers can introspect the lock state
+  _lock: lock,
 };
