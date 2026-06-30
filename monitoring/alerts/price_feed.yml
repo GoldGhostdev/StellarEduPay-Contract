@@ -1,0 +1,55 @@
+groups:
+  - name: price_feed
+    interval: 60s
+    rules:
+      # ── Warning: feed has been stale for 5+ minutes ──────────────────────
+      # price_feed_staleness_seconds rises continuously while providers are
+      # down. A 5-minute threshold gives a heads-up before fiat display
+      # silently degrades.
+      - alert: PriceFeedStalenessWarning
+        expr: price_feed_staleness_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Price feed {{ $labels.provider }} is stale (> 5 min)"
+          description: >
+            The {{ $labels.provider }} price feed has not returned a fresh rate
+            for {{ $value | humanizeDuration }}. Fiat display may be serving
+            cached (stale) values. Check CoinGecko / Coinbase status and
+            StellarEduPay logs.
+          runbook_url: "https://github.com/manuelusman73-png/StellarEduPay/blob/main/docs/runbooks/price-feed-staleness.md"
+
+      # ── Critical: stale flag set and no recovery after 15 minutes ────────
+      # price_feed_stale{provider} is set to 1 only when the
+      # stale-while-revalidate window is exhausted. At that point fiat amounts
+      # show "rate unavailable" to end users.
+      - alert: PriceFeedStale
+        expr: price_feed_stale == 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Price feed {{ $labels.provider }} cache exhausted — fiat display degraded"
+          description: >
+            The {{ $labels.provider }} price feed stale-while-revalidate window
+            has been exhausted for more than 15 minutes. All fiat currency
+            conversions are returning "rate unavailable". Immediate investigation
+            required. Last successful fetch timestamp:
+            {{ query "price_feed_last_success_timestamp{provider=\"" }}{{ $labels.provider }}{{ query "\"}" | first | value | humanizeTimestamp }}.
+          runbook_url: "https://github.com/manuelusman73-png/StellarEduPay/blob/main/docs/runbooks/price-feed-staleness.md"
+
+      # ── Info: last-success timestamp has not advanced in 10 minutes ──────
+      # Catches the edge case where the metric exists but is frozen (process
+      # restart wiped the in-memory counter and no successful fetch has happened).
+      - alert: PriceFeedNoRecentSuccess
+        expr: (time() - price_feed_last_success_timestamp) > 600 and price_feed_last_success_timestamp > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No successful price feed fetch from {{ $labels.provider }} in 10 min"
+          description: >
+            {{ $labels.provider }} has not produced a successful price feed fetch
+            for {{ $value | humanizeDuration }}. Fiat display may degrade soon.
+          runbook_url: "https://github.com/manuelusman73-png/StellarEduPay/blob/main/docs/runbooks/price-feed-staleness.md"
