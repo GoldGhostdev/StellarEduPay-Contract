@@ -1,4 +1,4 @@
-# StellarEduPay
+# StellarEduPay-Contract
 
 A production-grade, multi-tenant school fee payment system built on the Stellar blockchain. StellarEduPay delivers transparent, immutable, and verifiable fee payments — eliminating manual reconciliation, reducing fraud, and providing instant proof of payment for schools and parents alike.
 
